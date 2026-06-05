@@ -365,10 +365,15 @@ class DetectionPipeline:
             return ""
 
     # ── Main entry ────────────────────────────────────────────────────────────
-    def infer(self, frame) -> List[Detection]:
-        """Full pipeline on one frame → list of Detection."""
+    def infer(self, frame, force_ocr: bool = False) -> List[Detection]:
+        """Full pipeline on one frame → list of Detection.
+
+        When `force_ocr` is True, OCR runs regardless of the frame counter.
+        This is useful for single-image uploads, which would otherwise only
+        run OCR every `ocr_every` frames.
+        """
         self._frame_idx += 1
-        run_ocr = (self._frame_idx % self.ocr_every == 0)
+        run_ocr = force_ocr or (self._frame_idx % self.ocr_every == 0)
         t = time.perf_counter
         t_car = t_sb = t_lp = t_ocr = 0.0
 

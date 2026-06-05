@@ -7,11 +7,12 @@ application with a simple browser UI.
 
 import tempfile
 import threading
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Tuple
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
 import modal
 import sys
 
@@ -19,6 +20,8 @@ sys.path.append("/root/project")
 
 
 app = modal.App("driveguard-api")
+
+JOB_STORE = modal.Dict.from_name("driveguard-progress", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim()
@@ -122,7 +125,48 @@ def _encode_image(frame, suffix: str) -> Tuple[bytes, str]:
     return encoded.tobytes(), content_type
 
 
-def process_image_bytes(file_bytes: bytes, filename: str):
+def _job_key(job_id: str) -> str:
+    return f"job:{job_id}"
+
+
+def _load_job(job_id: str) -> dict:
+    job = JOB_STORE.get(_job_key(job_id))
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+def _save_job(job_id: str, **updates) -> dict:
+    job = JOB_STORE.get(_job_key(job_id), {}) or {}
+    job.update(updates)
+    JOB_STORE.put(_job_key(job_id), job)
+    return job
+
+
+def _count_video_frames(video_path: Path) -> int:
+    import cv2
+
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return 0
+    total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total > 0:
+        capture.release()
+        return total
+
+    total = 0
+    try:
+        while True:
+            success, _ = capture.read()
+            if not success:
+                break
+            total += 1
+    finally:
+        capture.release()
+    return total
+
+
+def process_image_bytes(file_bytes: bytes, filename: str, force_ocr: bool = False):
     import cv2
     import numpy as np
     from detect_objects import draw_detections
@@ -133,13 +177,13 @@ def process_image_bytes(file_bytes: bytes, filename: str):
         raise HTTPException(status_code=400, detail="Could not decode the uploaded image")
 
     with PROCESS_LOCK:
-        detections = pipeline.infer(frame)
+        detections = pipeline.infer(frame, force_ocr=force_ocr)
         annotated = draw_detections(frame.copy(), detections, text_renderer)
 
     return _encode_image(annotated, Path(filename).suffix or ".jpg")
 
 
-def process_video_file(input_path: Path, output_path: Path):
+def process_video_file(input_path: Path, output_path: Path, progress_callback=None):
     import cv2
     from detect_objects import draw_detections
 
@@ -156,6 +200,14 @@ def process_video_file(input_path: Path, output_path: Path):
         capture.release()
         raise HTTPException(status_code=400, detail="Invalid video dimensions")
 
+    total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if total_frames <= 0:
+        capture.release()
+        total_frames = _count_video_frames(input_path)
+        capture = cv2.VideoCapture(str(input_path))
+        if not capture.isOpened():
+            raise HTTPException(status_code=400, detail="Could not reopen the uploaded video")
+
     writer = cv2.VideoWriter(
         str(output_path),
         cv2.VideoWriter_fourcc(*"mp4v"),
@@ -164,6 +216,7 @@ def process_video_file(input_path: Path, output_path: Path):
     )
 
     try:
+        processed_frames = 0
         while True:
             success, frame = capture.read()
             if not success:
@@ -174,11 +227,72 @@ def process_video_file(input_path: Path, output_path: Path):
                 annotated = draw_detections(frame.copy(), detections, text_renderer)
 
             writer.write(annotated)
+            processed_frames += 1
+            if progress_callback is not None:
+                progress_callback(processed_frames, total_frames)
     finally:
         capture.release()
         writer.release()
 
-    return output_path.read_bytes(), "video/mp4"
+    return output_path.read_bytes(), "video/mp4", total_frames
+
+
+def _run_image_job(job_id: str, file_bytes: bytes, filename: str) -> None:
+    try:
+        _save_job(job_id, status="processing", processed_frames=0, total_frames=1, message="Processing image")
+        output_bytes, media_type = process_image_bytes(file_bytes, filename, force_ocr=True)
+        _save_job(
+            job_id,
+            status="done",
+            processed_frames=1,
+            total_frames=1,
+            progress=100,
+            result_bytes=output_bytes,
+            result_media_type=media_type,
+            result_filename=f"{Path(filename).stem}_processed{Path(filename).suffix or '.png'}",
+            message="Ready",
+        )
+    except Exception as exc:
+        _save_job(job_id, status="failed", error=str(exc), message="Processing failed")
+
+
+def _run_video_job(job_id: str, file_bytes: bytes, filename: str) -> None:
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"driveguard-{job_id}-"))
+    input_path = temp_dir / filename
+    output_path = temp_dir / f"{Path(filename).stem}_processed.mp4"
+    input_path.write_bytes(file_bytes)
+
+    def _progress(done: int, total: int) -> None:
+        percent = int((done / max(total, 1)) * 100)
+        _save_job(
+            job_id,
+            status="processing",
+            processed_frames=done,
+            total_frames=total,
+            progress=percent,
+            message=f"Processing frame {done} of {total}",
+        )
+
+    try:
+        _save_job(job_id, status="processing", processed_frames=0, total_frames=0, progress=0, message="Starting video")
+        output_bytes, media_type, total_frames = process_video_file(input_path, output_path, progress_callback=_progress)
+        _save_job(
+            job_id,
+            status="done",
+            processed_frames=total_frames,
+            total_frames=total_frames,
+            progress=100,
+            result_bytes=output_bytes,
+            result_media_type=media_type,
+            result_filename=f"{Path(filename).stem}_processed.mp4",
+            message="Ready",
+        )
+    except Exception as exc:
+        _save_job(job_id, status="failed", error=str(exc), message="Processing failed")
+    finally:
+        import shutil
+
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def build_page() -> str:
@@ -602,58 +716,25 @@ def build_page() -> str:
             downloadLink.href = '#';
         }
 
-        function showProgress(message) {
+        function setProgress(processed, total, message) {
             document.body.classList.add('processing');
-            progressLabel.textContent = message;
-            progressPercent.textContent = '0%';
-            progressFill.classList.add('indeterminate');
-            progressFill.style.width = '35%';
+            const safeTotal = Math.max(total || 0, 1);
+            const safeProcessed = Math.min(Math.max(processed || 0, 0), safeTotal);
+            const percent = Math.min(Math.round((safeProcessed / safeTotal) * 100), 100);
+            progressLabel.textContent = message || `Processing ${safeProcessed} of ${safeTotal} frames`;
+            progressPercent.textContent = `${safeProcessed}/${safeTotal} frames (${percent}%)`;
+            progressFill.classList.remove('indeterminate');
+            progressFill.style.width = `${percent}%`;
             progressWrap.setAttribute('aria-hidden', 'false');
             progressWrap.style.display = 'grid';
-
-            progressValue = 0;
-            if (progressTimer) {
-                clearInterval(progressTimer);
-            }
-            progressTimer = setInterval(() => {
-                progressValue = Math.min(progressValue + 4, 92);
-                progressFill.classList.remove('indeterminate');
-                progressFill.style.width = `${progressValue}%`;
-                progressPercent.textContent = `${progressValue}%`;
-            }, 250);
-        }
-
-        function finishProgress(message = 'Complete') {
-            if (progressTimer) {
-                clearInterval(progressTimer);
-                progressTimer = null;
-            }
-            progressFill.classList.remove('indeterminate');
-            progressFill.style.width = '100%';
-            progressPercent.textContent = '100%';
-            progressLabel.textContent = message;
-
-            window.setTimeout(() => {
-                document.body.classList.remove('processing');
-                progressWrap.style.display = 'none';
-                progressWrap.setAttribute('aria-hidden', 'true');
-                progressFill.style.width = '0%';
-                progressPercent.textContent = '0%';
-                progressLabel.textContent = 'Processing upload...';
-            }, 450);
         }
 
         function resetProgress() {
-            if (progressTimer) {
-                clearInterval(progressTimer);
-                progressTimer = null;
-            }
             document.body.classList.remove('processing');
             progressWrap.style.display = 'none';
             progressWrap.setAttribute('aria-hidden', 'true');
-            progressFill.classList.remove('indeterminate');
             progressFill.style.width = '0%';
-            progressPercent.textContent = '0%';
+            progressPercent.textContent = '0/0 frames (0%)';
             progressLabel.textContent = 'Processing upload...';
         }
 
@@ -706,8 +787,8 @@ def build_page() -> str:
             }
 
             submitBtn.disabled = true;
-            setStatus('Processing on the deployed model...', 'busy');
-            showProgress('Processing upload...');
+            setStatus('Starting processing job...', 'busy');
+            resetProgress();
 
             try {
                 const formData = new FormData();
@@ -719,40 +800,76 @@ def build_page() -> str:
                     throw new Error(errorText || 'Processing failed');
                 }
 
-                const blob = await response.blob();
-                const contentType = response.headers.get('content-type') || blob.type || '';
-                const objectUrl = URL.createObjectURL(blob);
-                if (currentObjectUrl) {
-                    URL.revokeObjectURL(currentObjectUrl);
-                }
-                currentObjectUrl = objectUrl;
-                preview.innerHTML = '';
+                const startInfo = await response.json();
+                const jobId = startInfo.job_id;
+                const statusUrl = `/status/${jobId}`;
 
-                if (contentType.startsWith('image/')) {
-                    const image = document.createElement('img');
-                    image.src = objectUrl;
-                    image.alt = 'Processed result';
-                    preview.appendChild(image);
-                } else if (contentType.startsWith('video/')) {
-                    const video = document.createElement('video');
-                    video.src = objectUrl;
-                    video.controls = true;
-                    video.playsInline = true;
-                    preview.appendChild(video);
-                } else {
-                    const link = document.createElement('a');
-                    link.href = objectUrl;
-                    link.textContent = 'Open processed file';
-                    link.className = 'download';
-                    preview.appendChild(link);
-                }
+                await new Promise((resolve, reject) => {
+                    const pollStatus = async () => {
+                        try {
+                            const statusResponse = await fetch(statusUrl);
+                            if (!statusResponse.ok) {
+                                throw new Error('Could not read job status.');
+                            }
 
-                const extension = contentType.startsWith('video/') ? '.mp4' : '.png';
-                downloadLink.href = objectUrl;
-                downloadLink.download = file.name.replace(/\\.[^.]+$/, '') + '_processed' + extension;
-                downloadLink.style.display = 'inline-flex';
-                finishProgress('Ready to download');
-                setStatus('Processing complete.', 'idle');
+                            const status = await statusResponse.json();
+                            if (status.status === 'failed') {
+                                throw new Error(status.error || 'Processing failed');
+                            }
+
+                            setProgress(status.processed_frames, status.total_frames, status.message || 'Processing...');
+
+                            if (status.status === 'done') {
+                                const resultResponse = await fetch(`/result/${jobId}`);
+                                if (!resultResponse.ok) {
+                                    throw new Error('Processed file is not ready yet.');
+                                }
+
+                                const blob = await resultResponse.blob();
+                                const contentType = resultResponse.headers.get('content-type') || blob.type || '';
+                                const objectUrl = URL.createObjectURL(blob);
+                                if (currentObjectUrl) {
+                                    URL.revokeObjectURL(currentObjectUrl);
+                                }
+                                currentObjectUrl = objectUrl;
+                                preview.innerHTML = '';
+
+                                if (contentType.startsWith('image/')) {
+                                    const image = document.createElement('img');
+                                    image.src = objectUrl;
+                                    image.alt = 'Processed result';
+                                    preview.appendChild(image);
+                                } else if (contentType.startsWith('video/')) {
+                                    const video = document.createElement('video');
+                                    video.src = objectUrl;
+                                    video.controls = true;
+                                    video.playsInline = true;
+                                    preview.appendChild(video);
+                                } else {
+                                    const link = document.createElement('a');
+                                    link.href = objectUrl;
+                                    link.textContent = 'Open processed file';
+                                    link.className = 'download';
+                                    preview.appendChild(link);
+                                }
+
+                                const extension = contentType.startsWith('video/') ? '.mp4' : '.png';
+                                downloadLink.href = objectUrl;
+                                downloadLink.download = file.name.replace(/\\.[^.]+$/, '') + '_processed' + extension;
+                                downloadLink.style.display = 'inline-flex';
+                                setStatus('Processing complete.', 'idle');
+                                resolve();
+                                return;
+                            }
+
+                            window.setTimeout(pollStatus, 750);
+                        } catch (error) {
+                            reject(error);
+                        }
+                    };
+
+                    pollStatus();
+                });
             } catch (error) {
                 resetProgress();
                 clearPreview();
@@ -767,6 +884,7 @@ def build_page() -> str:
 
 
 @app.function(image=image, gpu="T4", timeout=60 * 30)
+@modal.concurrent(max_inputs=20)
 @modal.asgi_app()
 def fastapi_app():
     web_app = FastAPI(title="DriveGuard")
@@ -779,21 +897,11 @@ def fastapi_app():
     def favicon():
         return Response(status_code=204)
 
-    from fastapi import Request
-
     @web_app.post("/process")
-    async def process(request: Request):
-        form = await request.form()
-
-        if "file" not in form:
-            raise HTTPException(status_code=400, detail="No file uploaded")
-
-        file = form["file"]
-
-        filename = getattr(file, "filename", "upload")
+    async def process(file: UploadFile = File(...)):
+        filename = file.filename or "upload"
         suffix = Path(filename).suffix.lower()
-        content_type = getattr(file, "content_type", "") or ""
-
+        content_type = (file.content_type or "").lower()
         payload = await file.read()
 
         is_image = content_type.startswith("image/") or suffix in {
@@ -804,42 +912,75 @@ def fastapi_app():
             ".mp4", ".mov", ".avi", ".mkv", ".webm"
         }
 
+        job_id = uuid.uuid4().hex
         if is_image:
-            output_bytes, media_type = process_image_bytes(payload, filename)
-            return Response(
-                content=output_bytes,
-                media_type=media_type,
-                headers={
-                    "Content-Disposition":
-                    f'inline; filename="{Path(filename).stem}_processed.jpg"'
-                },
-            )
+            JOB_STORE.put(_job_key(job_id), {
+                "status": "queued",
+                "type": "image",
+                "filename": filename,
+                "processed_frames": 0,
+                "total_frames": 1,
+                "progress": 0,
+                "message": "Queued",
+                "result_bytes": None,
+                "result_media_type": None,
+                "result_filename": None,
+                "error": None,
+            })
+            threading.Thread(target=_run_image_job, args=(job_id, payload, filename), daemon=True).start()
+            return JSONResponse({"job_id": job_id, "type": "image", "total_frames": 1})
 
         if is_video:
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_root = Path(tmp_dir)
-                input_path = tmp_root / filename
-                output_path = tmp_root / f"{Path(filename).stem}_processed.mp4"
-
-                input_path.write_bytes(payload)
-
-                output_bytes, media_type = process_video_file(
-                    input_path,
-                    output_path,
-                )
-
-                return Response(
-                    content=output_bytes,
-                    media_type=media_type,
-                    headers={
-                        "Content-Disposition":
-                        f'inline; filename="{Path(filename).stem}_processed.mp4"'
-                    },
-                )
+            total_frames = 0
+            JOB_STORE.put(_job_key(job_id), {
+                "status": "queued",
+                "type": "video",
+                "filename": filename,
+                "processed_frames": 0,
+                "total_frames": total_frames,
+                "progress": 0,
+                "message": "Queued",
+                "result_bytes": None,
+                "result_media_type": None,
+                "result_filename": None,
+                "error": None,
+            })
+            threading.Thread(target=_run_video_job, args=(job_id, payload, filename), daemon=True).start()
+            return JSONResponse({"job_id": job_id, "type": "video", "total_frames": total_frames})
 
         raise HTTPException(
             status_code=400,
             detail="Upload an image or video file."
+        )
+
+    @web_app.get("/status/{job_id}")
+    def status(job_id: str):
+        job = _load_job(job_id)
+        return {
+            "job_id": job_id,
+            "status": job.get("status", "unknown"),
+            "type": job.get("type"),
+            "filename": job.get("filename"),
+            "processed_frames": job.get("processed_frames", 0),
+            "total_frames": job.get("total_frames", 0),
+            "progress": job.get("progress", 0),
+            "message": job.get("message", ""),
+            "error": job.get("error"),
+        }
+
+    @web_app.get("/result/{job_id}")
+    def result(job_id: str):
+        job = _load_job(job_id)
+        if job.get("status") != "done":
+            raise HTTPException(status_code=202, detail="Result is not ready yet")
+
+        result_bytes = job.get("result_bytes")
+        media_type = job.get("result_media_type") or "application/octet-stream"
+        result_filename = job.get("result_filename") or "driveguard_processed.bin"
+        return Response(
+            content=result_bytes,
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{result_filename}"'},
         )
 
     return web_app
