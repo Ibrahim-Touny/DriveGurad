@@ -225,6 +225,8 @@ class PlateTracker:
 
         best, best_dist = None, float('inf')
         for track in self._tracks:
+            if track.get('age', 0) > 1:
+                continue
             tcx, tcy = self._center(track['box'])
             dist = math.hypot(cx - tcx, cy - tcy)
             if dist < best_dist:
@@ -332,10 +334,24 @@ class DetectionPipeline:
                 self._predict(model, batch, self.sub_imgsz)
 
         if self.ocr_reader is not None:
-            # Warm OCR once so the first real plate does not stall for model init.
+            # Warm OCR on blank and plate-like crops so the first real plate does
+            # not pay EasyOCR's lazy recognition/setup cost.
             try:
-                ocr_warm = np.zeros((48, 192, 3), dtype=np.uint8)
-                self.ocr_reader.readtext(ocr_warm, detail=0, paragraph=False)
+                blank = np.zeros((48, 192, 3), dtype=np.uint8)
+                plate_like = np.full((64, 240, 3), 235, dtype=np.uint8)
+                cv2.rectangle(plate_like, (4, 4), (235, 59), (0, 0, 0), 2)
+                cv2.putText(
+                    plate_like,
+                    "ABC 123",
+                    (18, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    (0, 0, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+                for ocr_warm in (blank, plate_like):
+                    self.ocr_reader.readtext(ocr_warm, detail=0, paragraph=False)
             except Exception:
                 pass
 
@@ -626,12 +642,26 @@ class VideoApp:
         self.pipeline.warmup()
         print("done.")
 
+    def _prime_video_start(self) -> None:
+        """Pay first real-frame inference cost before the playback window opens."""
+        cap = cv2.VideoCapture(self.input_path)
+        if not cap.isOpened():
+            return
+        try:
+            ok, frame = cap.read()
+            if ok:
+                self.pipeline.infer(frame, force_ocr=True)
+        finally:
+            cap.release()
+            self.pipeline.reset_temporal_state()
+
     # ── Inference worker ──────────────────────────────────────────────────────
     def _inference_worker(self, ready_event: threading.Event):
         # 1. Initialize CUDA in this worker thread and warm models before playback.
         self._prepare_inference()
+        self._prime_video_start()
 
-        # 3. Signal the main thread that warmup is finished and playback can start.
+        # 2. Signal the main thread that warmup is finished and playback can start.
         ready_event.set()
 
         while not self._stop.is_set():
