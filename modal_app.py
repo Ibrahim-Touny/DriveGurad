@@ -5,31 +5,34 @@ This exposes the existing detection pipeline through a Modal-hosted FastAPI
 application with a simple browser UI.
 """
 
-import tempfile
-import threading
-import uuid
-from functools import lru_cache
-from pathlib import Path
+import tempfile          # for creating temporary directories during video processing
+import threading         # to run jobs in background threads without blocking requests
+import uuid              # to generate unique job IDs
+from functools import lru_cache   # cache the loaded models so they are only loaded once
+from pathlib import Path          # convenient file path handling
 from typing import Optional, Tuple
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
-import modal
+import modal   # Modal cloud platform: runs this app on a GPU container
 import sys
 
-sys.path.append("/root/project")
+sys.path.append("/root/project")  # make detect_objects.py importable inside the container
 
 
-app = modal.App("driveguard-api")
+# Modal app and cloud resource setup
+app = modal.App("driveguard-api")  # the Modal app that hosts all functions and the web endpoint
 
-JOB_STORE = modal.Dict.from_name("driveguard-progress", create_if_missing=True)
-RESULT_VOLUME = modal.Volume.from_name("driveguard-results", create_if_missing=True)
-RESULT_DIR = Path("/root/project/results")
+JOB_STORE = modal.Dict.from_name("driveguard-progress", create_if_missing=True)    # stores job status/progress across requests
+RESULT_VOLUME = modal.Volume.from_name("driveguard-results", create_if_missing=True)  # persistent disk for saving processed files
+RESULT_DIR = Path("/root/project/results")  # path inside the container where results are written
 
+# Container image definition
+# Builds the Docker-like image Modal will use for every function call.
 image = (
-    modal.Image.debian_slim()
+    modal.Image.debian_slim()  # start from a minimal Debian base
     .apt_install(
-        "libgl1",
-        "libglib2.0-0"
+        "libgl1",        # required by OpenCV for image decoding
+        "libglib2.0-0"   # required by OpenCV on headless Linux
     )
     .pip_install(
         "torch",
@@ -54,40 +57,45 @@ image = (
     )
 )
 
-BASE_DIR = Path(__file__).resolve().parent
-PROCESS_LOCK = threading.Lock()
+BASE_DIR = Path(__file__).resolve().parent   # directory of this script (used for local file references)
+PROCESS_LOCK = threading.Lock()             # ensures only one request runs inference at a time (models are not thread-safe)
 
 
+# Model loading helpers
 def resolve_model_path(name: str) -> Path:
+    """Return the full path to a model file inside the container's Models folder."""
     return Path("/root/project/Models") / name
 
 
 def load_ocr_reader(device: str):
+    """Load EasyOCR for Arabic and English, then run a blank warmup to avoid first-request lag."""
     import easyocr
     import numpy as np
 
-    use_gpu_ocr = device == "cuda"
+    use_gpu_ocr = device == "cuda"  # use GPU if the detection device is also GPU
     try:
         reader = easyocr.Reader(["ar", "en"], gpu=use_gpu_ocr, verbose=False)
     except Exception:
-        reader = easyocr.Reader(["ar", "en"], gpu=False, verbose=False)
+        reader = easyocr.Reader(["ar", "en"], gpu=False, verbose=False)  # fall back to CPU if GPU init fails
 
     # Prime OCR once so the first detected plate does not pay model warmup cost.
     try:
-        warmup_crop = np.zeros((48, 192, 3), dtype=np.uint8)
+        warmup_crop = np.zeros((48, 192, 3), dtype=np.uint8)  # blank image to trigger internal model loading
         reader.readtext(warmup_crop, detail=0, paragraph=False)
     except Exception:
         pass
     return reader
 
 
-@lru_cache(maxsize=1)
+@lru_cache(maxsize=1)  # load models only once; reuse the same objects for all requests
 def get_runtime():
+    """Load and warm up all models. Cached so this only runs once per container."""
     from detect_objects import ArabicTextRenderer, DetectionPipeline, resolve_device
     from ultralytics import YOLO
 
-    device = resolve_device("auto")
+    device = resolve_device("auto")  # use GPU if available, otherwise CPU
 
+    # Load the three YOLO models.
     car_model = YOLO(str(resolve_model_path("yolo11n.pt"))).to(device)
     seatbelt_model = YOLO(str(resolve_model_path("SeatBeltModel2.pt"))).to(device)
     lp_model = YOLO(str(resolve_model_path("LicensePlateModel.pt"))).to(device)
@@ -108,18 +116,20 @@ def get_runtime():
         max_vehicles=8,
         profile=False,
     )
-    pipeline.warmup()
+    pipeline.warmup()  # run dummy inference to prepare CUDA/cuDNN before real requests arrive
     return pipeline, ArabicTextRenderer()
 
 
+# Utility functions (encoding, job store, flag parsing)
 def _encode_image(frame, suffix: str) -> Tuple[bytes, str]:
+    """Encode an OpenCV frame to bytes using the format matching the file suffix."""
     import cv2
 
     suffix = suffix.lower()
     if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}:
-        suffix = ".jpg"
+        suffix = ".jpg"  # default to JPEG for unknown formats
     if suffix in {".jpg", ".jpeg"}:
-        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])  # 95% quality JPEG
         content_type = "image/jpeg"
     elif suffix == ".png":
         ok, encoded = cv2.imencode(".png", frame)
@@ -133,14 +143,16 @@ def _encode_image(frame, suffix: str) -> Tuple[bytes, str]:
 
     if not ok:
         raise RuntimeError("Failed to encode processed image")
-    return encoded.tobytes(), content_type
+    return encoded.tobytes(), content_type  # return raw bytes and the MIME type
 
 
 def _job_key(job_id: str) -> str:
+    """Return the key used to store a job's data in JOB_STORE."""
     return f"job:{job_id}"
 
 
 def _load_job(job_id: str) -> dict:
+    """Load a job's data from JOB_STORE, raising 404 if it doesn't exist."""
     job = JOB_STORE.get(_job_key(job_id))
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -148,29 +160,33 @@ def _load_job(job_id: str) -> dict:
 
 
 def _save_job(job_id: str, **updates) -> dict:
-    job = JOB_STORE.get(_job_key(job_id), {}) or {}
-    job.update(updates)
+    """Merge updates into a job's stored data and write it back."""
+    job = JOB_STORE.get(_job_key(job_id), {}) or {}  # fetch existing data, default to empty dict
+    job.update(updates)  # apply the new fields
     JOB_STORE.put(_job_key(job_id), job)
     return job
 
 
 def _parse_flag(value: Optional[str], default: bool = True) -> bool:
+    """Convert a form string like '1' or 'true' to a boolean."""
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _count_video_frames(video_path: Path) -> int:
+    """Count total frames in a video (fallback when CAP_PROP_FRAME_COUNT is unreliable)."""
     import cv2
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         return 0
     total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if total > 0:
+    if total > 0:  # fast path: metadata is available and reliable
         capture.release()
         return total
 
+    # Slow path: count frames manually by reading through the whole video.
     total = 0
     try:
         while True:
@@ -183,6 +199,7 @@ def _count_video_frames(video_path: Path) -> int:
     return total
 
 
+# Core processing functions (image and video)
 def process_image_bytes(
     file_bytes: bytes,
     filename: str,
@@ -191,19 +208,21 @@ def process_image_bytes(
     enable_license_plate: bool = True,
     enable_ocr: bool = True,
 ):
+    """Run the detection pipeline on a single image and return (encoded_bytes, content_type)."""
     import cv2
     import numpy as np
     from detect_objects import draw_detections
 
-    pipeline, text_renderer = get_runtime()
-    frame = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
+    pipeline, text_renderer = get_runtime()  # get the cached model objects
+    frame = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)  # decode uploaded bytes to a BGR image
     if frame is None:
         raise HTTPException(status_code=400, detail="Could not decode the uploaded image")
 
-    with PROCESS_LOCK:
+    with PROCESS_LOCK:  # only one request may run inference at a time
         if hasattr(pipeline, "reset_temporal_state"):
-            pipeline.reset_temporal_state()
+            pipeline.reset_temporal_state()  # clear any leftover plate-tracking state from a previous request
 
+        # Temporarily disable models that the user turned off via the UI toggles.
         original_seatbelt_model = pipeline.seatbelt_model
         original_lp_model = pipeline.lp_model
         original_ocr_reader = pipeline.ocr_reader
@@ -218,13 +237,14 @@ def process_image_bytes(
 
             detections = pipeline.infer(frame, force_ocr=force_ocr and enable_ocr and enable_license_plate)
         finally:
+            # Always restore the original models even if inference raised an exception.
             pipeline.seatbelt_model = original_seatbelt_model
             pipeline.lp_model = original_lp_model
             pipeline.ocr_reader = original_ocr_reader
 
-        annotated = draw_detections(frame.copy(), detections, text_renderer)
+        annotated = draw_detections(frame.copy(), detections, text_renderer)  # draw boxes on a copy of the frame
 
-    return _encode_image(annotated, Path(filename).suffix or ".jpg")
+    return _encode_image(annotated, Path(filename).suffix or ".jpg")  # return the annotated image as bytes
 
 
 def process_video_file(
@@ -235,6 +255,7 @@ def process_video_file(
     enable_license_plate: bool = True,
     enable_ocr: bool = True,
 ):
+    """Run the detection pipeline on every frame and write an annotated video file."""
     import cv2
     from detect_objects import draw_detections
 
@@ -244,21 +265,22 @@ def process_video_file(
     if not capture.isOpened():
         raise HTTPException(status_code=400, detail="Could not open the uploaded video")
 
-    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0
+    fps = capture.get(cv2.CAP_PROP_FPS) or 30.0   # fall back to 30 fps if metadata is missing
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    if frame_width <= 0 or frame_height <= 0:
+    if frame_width <= 0 or frame_height <= 0:   # sanity check before creating a writer
         capture.release()
         raise HTTPException(status_code=400, detail="Invalid video dimensions")
 
     total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    if total_frames <= 0:
+    if total_frames <= 0:  # some containers don't store frame count; count manually
         capture.release()
         total_frames = _count_video_frames(input_path)
-        capture = cv2.VideoCapture(str(input_path))
+        capture = cv2.VideoCapture(str(input_path))  # reopen after manual count
         if not capture.isOpened():
             raise HTTPException(status_code=400, detail="Could not reopen the uploaded video")
 
+    # Try codecs in order; use the first one that opens successfully on this system.
     writer = None
     output_media_type = "video/mp4"
     output_path = output_path.with_suffix(".mp4")
@@ -276,12 +298,12 @@ def process_video_file(
             fps,
             (frame_width, frame_height),
         )
-        if candidate.isOpened():
+        if candidate.isOpened():   # this codec works on the current system
             writer = candidate
             output_path = candidate_path
             output_media_type = media_type
             break
-        candidate.release()
+        candidate.release()  # codec not supported; try the next one
 
     if writer is None:
         capture.release()
@@ -289,10 +311,11 @@ def process_video_file(
 
     try:
         processed_frames = 0
-        with PROCESS_LOCK:
+        with PROCESS_LOCK:  # only one request may run inference at a time
             if hasattr(pipeline, "reset_temporal_state"):
-                pipeline.reset_temporal_state()
+                pipeline.reset_temporal_state()  # clear plate-tracking state before this video
 
+            # Temporarily disable models the user turned off.
             original_seatbelt_model = pipeline.seatbelt_model
             original_lp_model = pipeline.lp_model
             original_ocr_reader = pipeline.ocr_reader
@@ -312,33 +335,35 @@ def process_video_file(
                         warm_frame,
                         force_ocr=(enable_ocr and enable_license_plate),
                     )
-                    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)  # seek back to the beginning
                     if hasattr(pipeline, "reset_temporal_state"):
-                        pipeline.reset_temporal_state()
+                        pipeline.reset_temporal_state()  # clear warmup state so real tracking starts fresh
 
                 while True:
                     success, frame = capture.read()
-                    if not success:
+                    if not success:   # end of video
                         break
 
                     detections = pipeline.infer(frame)
                     annotated = draw_detections(frame.copy(), detections, text_renderer)
 
-                    writer.write(annotated)
+                    writer.write(annotated)   # write the annotated frame to the output file
                     processed_frames += 1
                     if progress_callback is not None:
-                        progress_callback(processed_frames, total_frames)
+                        progress_callback(processed_frames, total_frames)  # update job progress
             finally:
+                # Restore models even if an exception occurred mid-video.
                 pipeline.seatbelt_model = original_seatbelt_model
                 pipeline.lp_model = original_lp_model
                 pipeline.ocr_reader = original_ocr_reader
     finally:
-        capture.release()
-        writer.release()
+        capture.release()   # always release the video reader
+        writer.release()    # flush and close the output file
 
-    return output_path.read_bytes(), output_media_type, total_frames
+    return output_path.read_bytes(), output_media_type, total_frames  # return file bytes to the job runner
 
 
+# Background job runners (called from daemon threads)
 def _run_image_job(
     job_id: str,
     file_bytes: bytes,
@@ -347,6 +372,7 @@ def _run_image_job(
     enable_license_plate: bool,
     enable_ocr: bool,
 ) -> None:
+    """Process one image job end-to-end and update JOB_STORE with the result."""
     try:
         _save_job(job_id, status="processing", processed_frames=0, total_frames=1, message="Processing image")
         output_bytes, media_type = process_image_bytes(
@@ -357,10 +383,10 @@ def _run_image_job(
             enable_license_plate=enable_license_plate,
             enable_ocr=enable_ocr,
         )
-        result_path = RESULT_DIR / f"{job_id}{Path(filename).suffix or '.jpg'}"
+        result_path = RESULT_DIR / f"{job_id}{Path(filename).suffix or '.jpg'}"  # unique filename per job
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_bytes(output_bytes)
-        RESULT_VOLUME.commit()
+        RESULT_VOLUME.commit()  # flush the volume so the file is visible to other containers
         _save_job(
             job_id,
             status="done",
@@ -384,12 +410,14 @@ def _run_video_job(
     enable_license_plate: bool,
     enable_ocr: bool,
 ) -> None:
-    temp_dir = Path(tempfile.mkdtemp(prefix=f"driveguard-{job_id}-"))
+    """Process one video job end-to-end and update JOB_STORE with the result."""
+    temp_dir = Path(tempfile.mkdtemp(prefix=f"driveguard-{job_id}-"))  # isolated temp folder per job
     input_path = temp_dir / filename
     output_path = temp_dir / f"{Path(filename).stem}_processed.mp4"
-    input_path.write_bytes(file_bytes)
+    input_path.write_bytes(file_bytes)  # save the uploaded bytes to a real file for OpenCV
 
     def _progress(done: int, total: int) -> None:
+        """Compute percent done and write it to JOB_STORE so the UI can poll it."""
         percent = int((done / max(total, 1)) * 100)
         _save_job(
             job_id,
@@ -411,10 +439,10 @@ def _run_video_job(
             enable_ocr=enable_ocr,
         )
         output_ext = ".webm" if media_type == "video/webm" else ".mp4"
-        result_path = RESULT_DIR / f"{job_id}{output_ext}"
+        result_path = RESULT_DIR / f"{job_id}{output_ext}"  # unique filename per job
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_bytes(output_bytes)
-        RESULT_VOLUME.commit()
+        RESULT_VOLUME.commit()  # flush the volume so the file is visible to other containers
         _save_job(
             job_id,
             status="done",
@@ -430,10 +458,10 @@ def _run_video_job(
         _save_job(job_id, status="failed", error=str(exc), message="Processing failed")
     finally:
         import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)  # clean up the temp folder regardless of success or failure
 
-        shutil.rmtree(temp_dir, ignore_errors=True)
 
-
+# Browser UI (single-page HTML, CSS, and JavaScript)
 def build_page() -> str:
         return """<!DOCTYPE html>
 <html lang="en">
@@ -1060,9 +1088,11 @@ def build_page() -> str:
 </html>"""
 
 
+# FastAPI application and routes
+# Deploys on a T4 GPU, allows up to 20 concurrent requests, and serves as an ASGI app.
 @app.function(image=image, gpu="T4", timeout=60 * 30, volumes={"/root/project/results": RESULT_VOLUME})
-@modal.concurrent(max_inputs=20)
-@modal.asgi_app()
+@modal.concurrent(max_inputs=20)  # handle up to 20 simultaneous requests per container
+@modal.asgi_app()                  # expose this function as an ASGI-compatible web server
 def fastapi_app():
     # Pre-warm up models at startup to avoid cold start freeze
     print("[INFO] Pre-warming up models on startup...")
@@ -1076,10 +1106,12 @@ def fastapi_app():
 
     @web_app.get("/", response_class=HTMLResponse)
     def home():
+        """Serve the single-page upload UI."""
         return HTMLResponse(build_page())
 
     @web_app.get("/favicon.ico")
     def favicon():
+        """Return an empty 204 so browsers don't log a 404 for the favicon."""
         return Response(status_code=204)
 
     @web_app.post("/process")
@@ -1089,10 +1121,11 @@ def fastapi_app():
         enable_license_plate: str = Form("1"),
         enable_seatbelt: str = Form("1"),
     ):
+        """Accept an upload, create a job, start a background thread, and return the job ID."""
         filename = file.filename or "upload"
         suffix = Path(filename).suffix.lower()
         content_type = (file.content_type or "").lower()
-        payload = await file.read()
+        payload = await file.read()  # read the uploaded file into memory
         ocr_enabled = _parse_flag(enable_ocr)
         lp_enabled = _parse_flag(enable_license_plate)
         seatbelt_enabled = _parse_flag(enable_seatbelt)
@@ -1105,9 +1138,9 @@ def fastapi_app():
             ".mp4", ".mov", ".avi", ".mkv", ".webm"
         }
 
-        job_id = uuid.uuid4().hex
+        job_id = uuid.uuid4().hex  # unique ID for tracking this specific job
         if is_image:
-            JOB_STORE.put(_job_key(job_id), {
+            JOB_STORE.put(_job_key(job_id), {  # create the initial job record before starting the thread
                 "status": "queued",
                 "type": "image",
                 "filename": filename,
@@ -1123,12 +1156,12 @@ def fastapi_app():
             threading.Thread(
                 target=_run_image_job,
                 args=(job_id, payload, filename, seatbelt_enabled, lp_enabled, ocr_enabled),
-                daemon=True,
+                daemon=True,   # thread exits automatically when the process exits
             ).start()
             return JSONResponse({"job_id": job_id, "type": "image", "total_frames": 1})
 
         if is_video:
-            total_frames = 0
+            total_frames = 0   # actual count is determined inside the job runner
             JOB_STORE.put(_job_key(job_id), {
                 "status": "queued",
                 "type": "video",
@@ -1145,7 +1178,7 @@ def fastapi_app():
             threading.Thread(
                 target=_run_video_job,
                 args=(job_id, payload, filename, seatbelt_enabled, lp_enabled, ocr_enabled),
-                daemon=True,
+                daemon=True,   # thread exits automatically when the process exits
             ).start()
             return JSONResponse({"job_id": job_id, "type": "video", "total_frames": total_frames})
 
@@ -1156,6 +1189,7 @@ def fastapi_app():
 
     @web_app.get("/status/{job_id}")
     def status(job_id: str):
+        """Return the current progress and status for a job."""
         job = _load_job(job_id)
         return {
             "job_id": job_id,
@@ -1171,9 +1205,10 @@ def fastapi_app():
 
     @web_app.get("/result/{job_id}")
     def result(job_id: str):
+        """Stream the finished file back to the browser for preview or download."""
         job = _load_job(job_id)
         if job.get("status") != "done":
-            raise HTTPException(status_code=202, detail="Result is not ready yet")
+            raise HTTPException(status_code=202, detail="Result is not ready yet")  # 202 = accepted but not complete
 
         media_type = job.get("result_media_type") or "application/octet-stream"
         result_filename = job.get("result_filename") or "driveguard_processed.bin"
