@@ -447,7 +447,7 @@ def draw_detections(frame, detections: List[Detection],
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
         # Car label — above the box.
-        car_text = f"{name} {det.conf:.2f}"
+        car_text = f"{name} {round(det.conf, 1):.1f}"
         (tw, tht), base = cv2.getTextSize(car_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
         top = max(0, y1 - tht - 8)
         cv2.rectangle(frame, (x1, top), (x1 + tw, top + tht + base), color, cv2.FILLED)
@@ -456,7 +456,7 @@ def draw_detections(frame, detections: List[Detection],
 
         # Seatbelt label — bottom-left of the box.
         if sb_label is not None:
-            sb_text = f"{sb_label} {sb_conf:.2f}"
+            sb_text = f"{sb_label} {round(sb_conf, 1):.1f}"
             (sw, sh), _ = cv2.getTextSize(sb_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
             sb_top = max(0, y2 - sh - 8)
             cv2.rectangle(frame, (x1, sb_top), (x1 + sw, sb_top + sh + 4), color, cv2.FILLED)
@@ -530,14 +530,27 @@ class VideoApp:
         self._paused = False
 
     # ── Inference worker ──────────────────────────────────────────────────────
-    def _inference_worker(self):
-        # Initialise the CUDA context inside this thread so PyTorch is happy.
+    def _inference_worker(self, ready_event: threading.Event):
+        # 1. Initialise CUDA context in THIS thread — PyTorch ties the context
+        #    to the thread that first calls into CUDA.
         if self.pipeline.device == 'cuda':
             torch.cuda.init()
-            # Override the benchmark=True that Ultralytics enables — with our
-            # constant batch size it is unnecessary, and if any shape ever varies
-            # it would re-trigger the multi-second cuDNN search.
+            # Override benchmark=True set by Ultralytics. With our fixed batch
+            # size it is unnecessary; any shape change would re-trigger the
+            # multi-second cuDNN search we worked hard to eliminate.
             torch.backends.cudnn.benchmark = False
+
+        # 2. Warm up every model here, in the same thread and CUDA context that
+        #    will run real inference. This pays the cold-start cost (CUDA kernel
+        #    compilation, cuDNN tuning) before the video window opens, so frame
+        #    #1 is already fast when the user sees it.
+        print("Warming up models… ", end="", flush=True)
+        self.pipeline.warmup()
+        print("done.")
+
+        # 3. Signal the main thread that warmup is finished and playback can start.
+        ready_event.set()
+
         while not self._stop.is_set():
             try:
                 frame = self._infer_queue.get(timeout=0.05)
@@ -640,10 +653,15 @@ class VideoApp:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(self.output_path, fourcc, fps, (fw, fh))
 
-        # Warm up models, then start the inference thread.
-        self.pipeline.warmup()
-        worker = threading.Thread(target=self._inference_worker, daemon=True)
+        # Start the inference thread. It initialises CUDA, warms up all models,
+        # then sets ready_event. The main thread blocks here until warmup is
+        # complete — so the video window only opens when inference is fully ready
+        # and frame #1 will already have fast detection instead of 0 FPS.
+        ready_event = threading.Event()
+        worker = threading.Thread(target=self._inference_worker,
+                                  args=(ready_event,), daemon=True)
         worker.start()
+        ready_event.wait()   # blocks until warmup done; then we open the window
 
         if self.show_live:
             cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -653,17 +671,22 @@ class VideoApp:
         screen = get_screen_resolution()
 
         self._start_time = self._last_frame_time = time.time()
-        annotated = None
-        last_frame = None
+        annotated = None       # last drawn overlay
+        last_frame = None      # last decoded raw frame
+        last_infer_seen = -1   # _infer_count value when we last redrew
+
+        # Always pace display to video FPS regardless of --realtime flag.
+        # Letting the display run uncapped (e.g. 196 FPS) makes draw_detections
+        # (with its PIL pass) dominate the main thread and starves the GPU,
+        # cutting inference FPS roughly in half.
+        display_interval = 1.0 / fps if fps > 0 else 1.0 / 30.0
 
         try:
             while True:
                 # ── Paused: keep refining the current frame ────────────────────
-                # Instead of freezing, we keep feeding the paused frame to the
-                # inference thread and redraw with the newest results. Because the
-                # frame is static, detection converges and OCR (which runs only
-                # every N frames) gets its chance — so when you unpause, the frame
-                # is already fully processed.
+                # Feed the same frame repeatedly so inference keeps running and
+                # OCR fires (every N frames). Redraw only when a new inference
+                # result arrives so the PIL pass isn't wasted.
                 if self._paused:
                     if last_frame is not None:
                         try:
@@ -671,10 +694,13 @@ class VideoApp:
                         except queue.Full:
                             pass
                         with self._lock:
+                            ic = self._infer_count
                             detections = self._detections
-                        annotated = draw_detections(last_frame.copy(), detections,
-                                                    self.text_renderer)
-                        if self.show_live:
+                        if ic != last_infer_seen:   # new result → redraw
+                            annotated = draw_detections(last_frame.copy(), detections,
+                                                        self.text_renderer)
+                            last_infer_seen = ic
+                        if self.show_live and annotated is not None:
                             disp = self._compose(last_frame, annotated, screen)
                             self._draw_hud(disp, status="PAUSED")
                             cv2.imshow(self.WINDOW_NAME, disp)
@@ -696,10 +722,17 @@ class VideoApp:
                     except queue.Full:
                         pass
 
-                # Overlay the latest available detections (never blocks).
+                # Only redraw the overlay when a new inference result is ready.
+                # This means draw_detections (PIL pass) runs at inference FPS,
+                # not display FPS — removing the main source of GPU contention.
                 with self._lock:
+                    ic = self._infer_count
                     detections = self._detections
-                annotated = draw_detections(frame.copy(), detections, self.text_renderer)
+                if ic != last_infer_seen:
+                    annotated = draw_detections(frame.copy(), detections, self.text_renderer)
+                    last_infer_seen = ic
+                elif annotated is None:
+                    annotated = frame.copy()   # blank until first inference
 
                 if out is not None:
                     out.write(annotated)
@@ -711,15 +744,14 @@ class VideoApp:
                     if not self._handle_key(cap, cv2.waitKey(1) & 0xFF, seek_step):
                         break
 
-                # Pace playback to the source FPS.
-                if self.realtime and fps > 0:
-                    target = self._last_frame_time + target_interval
-                    now = time.time()
-                    if now < target:
-                        time.sleep(target - now)
-                        self._last_frame_time = target
-                    else:
-                        self._last_frame_time = now
+                # Pace display to video FPS (always on, replaces --realtime flag).
+                target = self._last_frame_time + display_interval
+                now = time.time()
+                if now < target:
+                    time.sleep(target - now)
+                    self._last_frame_time = target
+                else:
+                    self._last_frame_time = now
         finally:
             self._stop.set()
             worker.join(timeout=3.0)
@@ -744,7 +776,7 @@ def parse_args():
         description='Vehicle detection → seatbelt + Egyptian license plate (OCR)')
     p.add_argument('--input', type=str, required=True)
     p.add_argument('--output', type=str, required=False)
-    p.add_argument('--car-weights', type=str, default='CarDetectionModel.pt',
+    p.add_argument('--car-weights', type=str, default='yolo11n.pt',
                    help='Car detector. yolo11n.pt (COCO) or CarDetectionModel.pt (KITTI).')
     p.add_argument('--seatbelt-weights', type=str, default='SeatBeltModel.pt')
     p.add_argument('--lp-weights', type=str, default='LicensePlateModel.pt',
@@ -781,7 +813,9 @@ def parse_args():
     p.add_argument('--display-width', type=int, default=640)
     p.add_argument('--display-height', type=int, default=360)
     p.add_argument('--fullscreen', action='store_true')
-    p.add_argument('--realtime', action='store_true')
+    p.add_argument('--realtime', action='store_true',
+                   help='Deprecated — display is now always capped to video FPS. '
+                        'Kept for backward compatibility.')
     return p.parse_args()
 
 
