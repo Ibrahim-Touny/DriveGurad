@@ -800,10 +800,10 @@ def build_page() -> str:
         <section class="hero">
             <div class="headline">
                 <div class="eyebrow">DriveGuard inference studio</div>
-                <h1>Upload an image or video and get the annotated result back.</h1>
+                <h1>Upload an image or video and get the processed result back.</h1>
                 <p class="subcopy">
                     The uploaded media is processed with the deployed vehicle, seatbelt, and license-plate models.
-                    Processed output is returned directly in the browser so you can preview or download it immediately.
+                    Processed output is returned directly, you can preview or download it immediately.
                 </p>
             </div>
             <div class="stats">
