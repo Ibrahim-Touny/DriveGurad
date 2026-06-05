@@ -63,13 +63,22 @@ def resolve_model_path(name: str) -> Path:
 
 
 def load_ocr_reader(device: str):
-        import easyocr
+    import easyocr
+    import numpy as np
 
-        use_gpu_ocr = device == "cuda"
-        try:
-                return easyocr.Reader(["ar"], gpu=use_gpu_ocr, verbose=False)
-        except Exception:
-                return easyocr.Reader(["ar"], gpu=False, verbose=False)
+    use_gpu_ocr = device == "cuda"
+    try:
+        reader = easyocr.Reader(["ar", "en"], gpu=use_gpu_ocr, verbose=False)
+    except Exception:
+        reader = easyocr.Reader(["ar", "en"], gpu=False, verbose=False)
+
+    # Prime OCR once so the first detected plate does not pay model warmup cost.
+    try:
+        warmup_crop = np.zeros((48, 192, 3), dtype=np.uint8)
+        reader.readtext(warmup_crop, detail=0, paragraph=False)
+    except Exception:
+        pass
+    return reader
 
 
 @lru_cache(maxsize=1)
@@ -95,7 +104,7 @@ def get_runtime():
         device=device,
         imgsz=640,
         sub_imgsz=320,
-        ocr_every=5,
+        ocr_every=1,
         max_vehicles=8,
         profile=False,
     )
@@ -247,12 +256,22 @@ def process_video_file(
         if not capture.isOpened():
             raise HTTPException(status_code=400, detail="Could not reopen the uploaded video")
 
-    writer = cv2.VideoWriter(
-        str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        fps,
-        (frame_width, frame_height),
-    )
+    writer = None
+    for codec in ("avc1", "H264", "mp4v"):
+        candidate = cv2.VideoWriter(
+            str(output_path),
+            cv2.VideoWriter_fourcc(*codec),
+            fps,
+            (frame_width, frame_height),
+        )
+        if candidate.isOpened():
+            writer = candidate
+            break
+        candidate.release()
+
+    if writer is None:
+        capture.release()
+        raise HTTPException(status_code=500, detail="Could not create output video writer")
 
     try:
         processed_frames = 0
