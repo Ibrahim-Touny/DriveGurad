@@ -1062,6 +1062,14 @@ def build_page() -> str:
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app()
 def fastapi_app():
+    # Pre-warm up models at startup to avoid cold start freeze
+    print("[INFO] Pre-warming up models on startup...")
+    try:
+        pipeline, _ = get_runtime()
+        print("[INFO] Model warmup complete. Ready for requests.")
+    except Exception as e:
+        print(f"[WARN] Model warmup failed: {e}")
+    
     web_app = FastAPI(title="DriveGuard")
 
     @web_app.get("/", response_class=HTMLResponse)
