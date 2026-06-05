@@ -74,7 +74,7 @@ def get_runtime():
 
     device = resolve_device("auto")
 
-    car_model = YOLO(str(resolve_model_path("CarDetectionModel.pt"))).to(device)
+    car_model = YOLO(str(resolve_model_path("yolo11n.pt"))).to(device)
     seatbelt_model = YOLO(str(resolve_model_path("SeatBeltModel.pt"))).to(device)
     lp_model = YOLO(str(resolve_model_path("LicensePlateModel.pt"))).to(device)
     ocr_reader = load_ocr_reader(device)
