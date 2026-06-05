@@ -201,6 +201,9 @@ def process_image_bytes(
         raise HTTPException(status_code=400, detail="Could not decode the uploaded image")
 
     with PROCESS_LOCK:
+        if hasattr(pipeline, "reset_temporal_state"):
+            pipeline.reset_temporal_state()
+
         original_seatbelt_model = pipeline.seatbelt_model
         original_lp_model = pipeline.lp_model
         original_ocr_reader = pipeline.ocr_reader
@@ -257,15 +260,26 @@ def process_video_file(
             raise HTTPException(status_code=400, detail="Could not reopen the uploaded video")
 
     writer = None
-    for codec in ("avc1", "H264", "mp4v"):
+    output_media_type = "video/mp4"
+    output_path = output_path.with_suffix(".mp4")
+    for codec, ext, media_type in (
+        ("avc1", ".mp4", "video/mp4"),
+        ("H264", ".mp4", "video/mp4"),
+        ("VP80", ".webm", "video/webm"),
+        ("vp80", ".webm", "video/webm"),
+        ("mp4v", ".mp4", "video/mp4"),
+    ):
+        candidate_path = output_path.with_suffix(ext)
         candidate = cv2.VideoWriter(
-            str(output_path),
+            str(candidate_path),
             cv2.VideoWriter_fourcc(*codec),
             fps,
             (frame_width, frame_height),
         )
         if candidate.isOpened():
             writer = candidate
+            output_path = candidate_path
+            output_media_type = media_type
             break
         candidate.release()
 
@@ -276,6 +290,9 @@ def process_video_file(
     try:
         processed_frames = 0
         with PROCESS_LOCK:
+            if hasattr(pipeline, "reset_temporal_state"):
+                pipeline.reset_temporal_state()
+
             original_seatbelt_model = pipeline.seatbelt_model
             original_lp_model = pipeline.lp_model
             original_ocr_reader = pipeline.ocr_reader
@@ -287,6 +304,15 @@ def process_video_file(
                     pipeline.ocr_reader = None
                 elif not enable_ocr:
                     pipeline.ocr_reader = None
+
+                # Prime model+OCR path on a real frame, then restart from frame 0.
+                warm_ok, warm_frame = capture.read()
+                if warm_ok:
+                    pipeline.infer(
+                        warm_frame,
+                        force_ocr=(enable_ocr and enable_license_plate),
+                    )
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
                 while True:
                     success, frame = capture.read()
@@ -308,7 +334,7 @@ def process_video_file(
         capture.release()
         writer.release()
 
-    return output_path.read_bytes(), "video/mp4", total_frames
+    return output_path.read_bytes(), output_media_type, total_frames
 
 
 def _run_image_job(
@@ -382,7 +408,8 @@ def _run_video_job(
             enable_license_plate=enable_license_plate,
             enable_ocr=enable_ocr,
         )
-        result_path = RESULT_DIR / f"{job_id}.mp4"
+        output_ext = ".webm" if media_type == "video/webm" else ".mp4"
+        result_path = RESULT_DIR / f"{job_id}{output_ext}"
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_bytes(output_bytes)
         RESULT_VOLUME.commit()
@@ -393,7 +420,7 @@ def _run_video_job(
             total_frames=total_frames,
             progress=100,
             result_media_type=media_type,
-            result_filename=f"{Path(filename).stem}_processed.mp4",
+            result_filename=f"{Path(filename).stem}_processed{output_ext}",
             result_path=str(result_path),
             message="Ready",
         )
@@ -1001,7 +1028,7 @@ def build_page() -> str:
                                     preview.appendChild(link);
                                 }
 
-                                const extension = contentType.startsWith('video/') ? '.mp4' : '.png';
+                                const extension = contentType.includes('webm') ? '.webm' : (contentType.startsWith('video/') ? '.mp4' : '.png');
                                 downloadLink.href = objectUrl;
                                 downloadLink.download = file.name.replace(/\\.[^.]+$/, '') + '_processed' + extension;
                                 downloadLink.style.display = 'inline-flex';

@@ -85,6 +85,9 @@ LP_TEXT_BG_COLOR   = (20, 20, 20)   # dark background behind plate text
 
 # Fonts tried (in order) for rendering Arabic plate text.
 _FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
     "C:/Windows/Fonts/tahoma.ttf",
     "C:/Windows/Fonts/arial.ttf",
     "C:/Windows/Fonts/times.ttf",
@@ -320,6 +323,11 @@ class DetectionPipeline:
         for model in (self.seatbelt_model, self.lp_model):
             if model is not None:
                 self._predict(model, batch, self.sub_imgsz)
+
+    def reset_temporal_state(self) -> None:
+        """Reset per-stream tracking state before processing a new file."""
+        self._tracker = PlateTracker()
+        self._frame_idx = 0
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     @staticmethod
