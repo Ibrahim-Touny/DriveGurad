@@ -90,6 +90,19 @@ _FONT_CANDIDATES = [
     "C:/Windows/Fonts/times.ttf",
 ]
 
+_IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp'}
+
+# Seatbelt label normalization across different model taxonomies.
+# Map to canonical labels for coloring; None means ignore the class.
+SEATBELT_LABEL_MAP = {
+    'seatbelt': 'seatbelt',
+    'no-seatbelt': 'no-seatbelt',
+    'no seatbelt': 'no-seatbelt',
+    'no_seatbelt': 'no-seatbelt',
+    'mobile': 'no-seatbelt',
+    'windshield': None,
+}
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # Data structures
@@ -304,14 +317,33 @@ class DetectionPipeline:
         return frame[cy1:cy2, cx1:cx2], (cx1, cy1)
 
     @staticmethod
-    def _best_label(result, model) -> Optional[Tuple[str, float]]:
+    def _normalize_seatbelt_label(label: str) -> Optional[str]:
+        key = label.strip().lower()
+        if key in SEATBELT_LABEL_MAP:
+            return SEATBELT_LABEL_MAP[key]
+        return None
+
+    def _best_label(self, result, model, label_normalizer=None) -> Optional[Tuple[str, float]]:
         """Highest-confidence (label, conf) from a Results object, or None."""
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             return None
-        i = int(boxes.conf.argmax().item())
-        label = model.names.get(int(boxes.cls[i].item()), "unknown")
-        return label, float(boxes.conf[i].item())
+
+        best_label = None
+        best_conf = -1.0
+        for i in range(len(boxes)):
+            raw = model.names.get(int(boxes.cls[i].item()), "unknown")
+            label = label_normalizer(raw) if label_normalizer else raw
+            if label is None:
+                continue
+            conf = float(boxes.conf[i].item())
+            if conf > best_conf:
+                best_conf = conf
+                best_label = label
+
+        if best_label is None:
+            return None
+        return best_label, best_conf
 
     def _ocr(self, frame, box: Box) -> str:
         """Run EasyOCR on a plate crop (CPU). Egyptian plates: Arabic letters
@@ -386,7 +418,11 @@ class DetectionPipeline:
             t0 = t()
             results = self._predict(self.seatbelt_model, batch, self.sub_imgsz)[:n_real]
             for (idx, _, _), result in zip(crop_meta, results):
-                detections[idx].seatbelt = self._best_label(result, self.seatbelt_model)
+                detections[idx].seatbelt = self._best_label(
+                    result,
+                    self.seatbelt_model,
+                    label_normalizer=self._normalize_seatbelt_label,
+                )
             t_sb = t() - t0
 
         # Stage 3 — license plates on the fixed-size batch (at sub_imgsz).
@@ -529,24 +565,18 @@ class VideoApp:
         self._last_frame_time = 0.0
         self._paused = False
 
-    # ── Inference worker ──────────────────────────────────────────────────────
-    def _inference_worker(self, ready_event: threading.Event):
-        # 1. Initialise CUDA context in THIS thread — PyTorch ties the context
-        #    to the thread that first calls into CUDA.
+    def _prepare_inference(self) -> None:
         if self.pipeline.device == 'cuda':
             torch.cuda.init()
-            # Override benchmark=True set by Ultralytics. With our fixed batch
-            # size it is unnecessary; any shape change would re-trigger the
-            # multi-second cuDNN search we worked hard to eliminate.
             torch.backends.cudnn.benchmark = False
-
-        # 2. Warm up every model here, in the same thread and CUDA context that
-        #    will run real inference. This pays the cold-start cost (CUDA kernel
-        #    compilation, cuDNN tuning) before the video window opens, so frame
-        #    #1 is already fast when the user sees it.
         print("Warming up models… ", end="", flush=True)
         self.pipeline.warmup()
         print("done.")
+
+    # ── Inference worker ──────────────────────────────────────────────────────
+    def _inference_worker(self, ready_event: threading.Event):
+        # 1. Initialize CUDA in this worker thread and warm models before playback.
+        self._prepare_inference()
 
         # 3. Signal the main thread that warmup is finished and playback can start.
         ready_event.set()
@@ -588,6 +618,33 @@ class VideoApp:
         if not self.show_original:
             return ann
         return cv2.hconcat([cv2.resize(original, (pw, ph)), ann])
+
+    def _run_image(self):
+        frame = cv2.imread(self.input_path)
+        if frame is None:
+            raise ValueError(f"Error opening image: {self.input_path}")
+
+        self._prepare_inference()
+        detections = self.pipeline.infer(frame)
+        annotated = draw_detections(frame.copy(), detections, self.text_renderer)
+
+        if self.save_output:
+            cv2.imwrite(self.output_path, annotated)
+            print(f"Done. Output saved to: {self.output_path}")
+
+        if self.show_live:
+            cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
+            if self.fullscreen:
+                cv2.setWindowProperty(self.WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                                      cv2.WINDOW_FULLSCREEN)
+            screen = get_screen_resolution()
+            disp = self._compose(frame, annotated, screen)
+            while True:
+                cv2.imshow(self.WINDOW_NAME, disp)
+                key = cv2.waitKey(50) & 0xFF
+                if key in (ord('q'), 27, ord(' ')):
+                    break
+            cv2.destroyAllWindows()
 
     def _fps(self):
         elapsed = time.time() - self._start_time
@@ -637,6 +694,9 @@ class VideoApp:
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     def run(self):
+        if os.path.splitext(self.input_path)[1].lower() in _IMAGE_EXTS:
+            return self._run_image()
+
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
             raise ValueError(f"Error opening video source: {self.input_path}")
@@ -778,7 +838,7 @@ def parse_args():
     p.add_argument('--output', type=str, required=False)
     p.add_argument('--car-weights', type=str, default='yolo11n.pt',
                    help='Car detector. yolo11n.pt (COCO) or CarDetectionModel.pt (KITTI).')
-    p.add_argument('--seatbelt-weights', type=str, default='SeatBeltModel.pt')
+    p.add_argument('--seatbelt-weights', type=str, default='SeatBeltModel2.pt')
     p.add_argument('--lp-weights', type=str, default='LicensePlateModel.pt',
                    help='Egyptian license-plate detector weights.')
     p.add_argument('--no-sb', action='store_true', help='Disable seatbelt detection entirely.')
