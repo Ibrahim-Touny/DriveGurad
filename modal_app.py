@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Tuple
 from fastapi import FastAPI, File, HTTPException, Response, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import modal
 import sys
 
@@ -22,6 +22,8 @@ sys.path.append("/root/project")
 app = modal.App("driveguard-api")
 
 JOB_STORE = modal.Dict.from_name("driveguard-progress", create_if_missing=True)
+RESULT_VOLUME = modal.Volume.from_name("driveguard-results", create_if_missing=True)
+RESULT_DIR = Path("/root/project/results")
 
 image = (
     modal.Image.debian_slim()
@@ -241,15 +243,19 @@ def _run_image_job(job_id: str, file_bytes: bytes, filename: str) -> None:
     try:
         _save_job(job_id, status="processing", processed_frames=0, total_frames=1, message="Processing image")
         output_bytes, media_type = process_image_bytes(file_bytes, filename, force_ocr=True)
+        result_path = RESULT_DIR / f"{job_id}{Path(filename).suffix or '.jpg'}"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_bytes(output_bytes)
+        RESULT_VOLUME.commit()
         _save_job(
             job_id,
             status="done",
             processed_frames=1,
             total_frames=1,
             progress=100,
-            result_bytes=output_bytes,
             result_media_type=media_type,
             result_filename=f"{Path(filename).stem}_processed{Path(filename).suffix or '.png'}",
+            result_path=str(result_path),
             message="Ready",
         )
     except Exception as exc:
@@ -276,15 +282,19 @@ def _run_video_job(job_id: str, file_bytes: bytes, filename: str) -> None:
     try:
         _save_job(job_id, status="processing", processed_frames=0, total_frames=0, progress=0, message="Starting video")
         output_bytes, media_type, total_frames = process_video_file(input_path, output_path, progress_callback=_progress)
+        result_path = RESULT_DIR / f"{job_id}.mp4"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_bytes(output_bytes)
+        RESULT_VOLUME.commit()
         _save_job(
             job_id,
             status="done",
             processed_frames=total_frames,
             total_frames=total_frames,
             progress=100,
-            result_bytes=output_bytes,
             result_media_type=media_type,
             result_filename=f"{Path(filename).stem}_processed.mp4",
+            result_path=str(result_path),
             message="Ready",
         )
     except Exception as exc:
@@ -883,7 +893,7 @@ def build_page() -> str:
 </html>"""
 
 
-@app.function(image=image, gpu="T4", timeout=60 * 30)
+@app.function(image=image, gpu="T4", timeout=60 * 30, volumes={"/root/project/results": RESULT_VOLUME})
 @modal.concurrent(max_inputs=20)
 @modal.asgi_app()
 def fastapi_app():
@@ -922,9 +932,9 @@ def fastapi_app():
                 "total_frames": 1,
                 "progress": 0,
                 "message": "Queued",
-                "result_bytes": None,
                 "result_media_type": None,
                 "result_filename": None,
+                "result_path": None,
                 "error": None,
             })
             threading.Thread(target=_run_image_job, args=(job_id, payload, filename), daemon=True).start()
@@ -940,9 +950,9 @@ def fastapi_app():
                 "total_frames": total_frames,
                 "progress": 0,
                 "message": "Queued",
-                "result_bytes": None,
                 "result_media_type": None,
                 "result_filename": None,
+                "result_path": None,
                 "error": None,
             })
             threading.Thread(target=_run_video_job, args=(job_id, payload, filename), daemon=True).start()
@@ -974,13 +984,16 @@ def fastapi_app():
         if job.get("status") != "done":
             raise HTTPException(status_code=202, detail="Result is not ready yet")
 
-        result_bytes = job.get("result_bytes")
         media_type = job.get("result_media_type") or "application/octet-stream"
         result_filename = job.get("result_filename") or "driveguard_processed.bin"
-        return Response(
-            content=result_bytes,
+        result_path = job.get("result_path")
+        if not result_path:
+            raise HTTPException(status_code=404, detail="Processed file is missing")
+
+        return FileResponse(
+            path=result_path,
             media_type=media_type,
-            headers={"Content-Disposition": f'inline; filename="{result_filename}"'},
+            filename=result_filename,
         )
 
     return web_app
