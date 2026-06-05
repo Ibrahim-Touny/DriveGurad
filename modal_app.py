@@ -10,8 +10,8 @@ import threading
 import uuid
 from functools import lru_cache
 from pathlib import Path
-from typing import Tuple
-from fastapi import FastAPI, File, HTTPException, Response, UploadFile
+from typing import Optional, Tuple
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import modal
 import sys
@@ -145,6 +145,12 @@ def _save_job(job_id: str, **updates) -> dict:
     return job
 
 
+def _parse_flag(value: Optional[str], default: bool = True) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _count_video_frames(video_path: Path) -> int:
     import cv2
 
@@ -168,7 +174,14 @@ def _count_video_frames(video_path: Path) -> int:
     return total
 
 
-def process_image_bytes(file_bytes: bytes, filename: str, force_ocr: bool = False):
+def process_image_bytes(
+    file_bytes: bytes,
+    filename: str,
+    force_ocr: bool = False,
+    enable_seatbelt: bool = True,
+    enable_license_plate: bool = True,
+    enable_ocr: bool = True,
+):
     import cv2
     import numpy as np
     from detect_objects import draw_detections
@@ -179,13 +192,37 @@ def process_image_bytes(file_bytes: bytes, filename: str, force_ocr: bool = Fals
         raise HTTPException(status_code=400, detail="Could not decode the uploaded image")
 
     with PROCESS_LOCK:
-        detections = pipeline.infer(frame, force_ocr=force_ocr)
+        original_seatbelt_model = pipeline.seatbelt_model
+        original_lp_model = pipeline.lp_model
+        original_ocr_reader = pipeline.ocr_reader
+        try:
+            if not enable_seatbelt:
+                pipeline.seatbelt_model = None
+            if not enable_license_plate:
+                pipeline.lp_model = None
+                pipeline.ocr_reader = None
+            elif not enable_ocr:
+                pipeline.ocr_reader = None
+
+            detections = pipeline.infer(frame, force_ocr=force_ocr and enable_ocr and enable_license_plate)
+        finally:
+            pipeline.seatbelt_model = original_seatbelt_model
+            pipeline.lp_model = original_lp_model
+            pipeline.ocr_reader = original_ocr_reader
+
         annotated = draw_detections(frame.copy(), detections, text_renderer)
 
     return _encode_image(annotated, Path(filename).suffix or ".jpg")
 
 
-def process_video_file(input_path: Path, output_path: Path, progress_callback=None):
+def process_video_file(
+    input_path: Path,
+    output_path: Path,
+    progress_callback=None,
+    enable_seatbelt: bool = True,
+    enable_license_plate: bool = True,
+    enable_ocr: bool = True,
+):
     import cv2
     from detect_objects import draw_detections
 
@@ -219,19 +256,35 @@ def process_video_file(input_path: Path, output_path: Path, progress_callback=No
 
     try:
         processed_frames = 0
-        while True:
-            success, frame = capture.read()
-            if not success:
-                break
+        with PROCESS_LOCK:
+            original_seatbelt_model = pipeline.seatbelt_model
+            original_lp_model = pipeline.lp_model
+            original_ocr_reader = pipeline.ocr_reader
+            try:
+                if not enable_seatbelt:
+                    pipeline.seatbelt_model = None
+                if not enable_license_plate:
+                    pipeline.lp_model = None
+                    pipeline.ocr_reader = None
+                elif not enable_ocr:
+                    pipeline.ocr_reader = None
 
-            with PROCESS_LOCK:
-                detections = pipeline.infer(frame)
-                annotated = draw_detections(frame.copy(), detections, text_renderer)
+                while True:
+                    success, frame = capture.read()
+                    if not success:
+                        break
 
-            writer.write(annotated)
-            processed_frames += 1
-            if progress_callback is not None:
-                progress_callback(processed_frames, total_frames)
+                    detections = pipeline.infer(frame)
+                    annotated = draw_detections(frame.copy(), detections, text_renderer)
+
+                    writer.write(annotated)
+                    processed_frames += 1
+                    if progress_callback is not None:
+                        progress_callback(processed_frames, total_frames)
+            finally:
+                pipeline.seatbelt_model = original_seatbelt_model
+                pipeline.lp_model = original_lp_model
+                pipeline.ocr_reader = original_ocr_reader
     finally:
         capture.release()
         writer.release()
@@ -239,10 +292,24 @@ def process_video_file(input_path: Path, output_path: Path, progress_callback=No
     return output_path.read_bytes(), "video/mp4", total_frames
 
 
-def _run_image_job(job_id: str, file_bytes: bytes, filename: str) -> None:
+def _run_image_job(
+    job_id: str,
+    file_bytes: bytes,
+    filename: str,
+    enable_seatbelt: bool,
+    enable_license_plate: bool,
+    enable_ocr: bool,
+) -> None:
     try:
         _save_job(job_id, status="processing", processed_frames=0, total_frames=1, message="Processing image")
-        output_bytes, media_type = process_image_bytes(file_bytes, filename, force_ocr=True)
+        output_bytes, media_type = process_image_bytes(
+            file_bytes,
+            filename,
+            force_ocr=True,
+            enable_seatbelt=enable_seatbelt,
+            enable_license_plate=enable_license_plate,
+            enable_ocr=enable_ocr,
+        )
         result_path = RESULT_DIR / f"{job_id}{Path(filename).suffix or '.jpg'}"
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_bytes(output_bytes)
@@ -262,7 +329,14 @@ def _run_image_job(job_id: str, file_bytes: bytes, filename: str) -> None:
         _save_job(job_id, status="failed", error=str(exc), message="Processing failed")
 
 
-def _run_video_job(job_id: str, file_bytes: bytes, filename: str) -> None:
+def _run_video_job(
+    job_id: str,
+    file_bytes: bytes,
+    filename: str,
+    enable_seatbelt: bool,
+    enable_license_plate: bool,
+    enable_ocr: bool,
+) -> None:
     temp_dir = Path(tempfile.mkdtemp(prefix=f"driveguard-{job_id}-"))
     input_path = temp_dir / filename
     output_path = temp_dir / f"{Path(filename).stem}_processed.mp4"
@@ -281,7 +355,14 @@ def _run_video_job(job_id: str, file_bytes: bytes, filename: str) -> None:
 
     try:
         _save_job(job_id, status="processing", processed_frames=0, total_frames=0, progress=0, message="Starting video")
-        output_bytes, media_type, total_frames = process_video_file(input_path, output_path, progress_callback=_progress)
+        output_bytes, media_type, total_frames = process_video_file(
+            input_path,
+            output_path,
+            progress_callback=_progress,
+            enable_seatbelt=enable_seatbelt,
+            enable_license_plate=enable_license_plate,
+            enable_ocr=enable_ocr,
+        )
         result_path = RESULT_DIR / f"{job_id}.mp4"
         result_path.parent.mkdir(parents=True, exist_ok=True)
         result_path.write_bytes(output_bytes)
@@ -499,6 +580,32 @@ def build_page() -> str:
             flex-wrap: wrap;
         }
 
+        .toggle-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 10px;
+            margin-top: 14px;
+            margin-bottom: 14px;
+        }
+
+        .toggle {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 12px 14px;
+            border-radius: 16px;
+            border: 1px solid rgba(255,255,255,0.08);
+            background: rgba(255,255,255,0.04);
+            color: var(--text);
+            user-select: none;
+        }
+
+        .toggle input {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--accent);
+        }
+
         .button {
             appearance: none;
             border: 0;
@@ -638,6 +745,7 @@ def build_page() -> str:
             h1 { font-size: 2.4rem; }
             .stats { grid-template-columns: 1fr; }
             .dropzone { min-height: 220px; }
+            .toggle-grid { grid-template-columns: 1fr; }
         }
     </style>
 </head>
@@ -670,6 +778,11 @@ def build_page() -> str:
                             <span>Image or video. The processed version will replace this preview panel once the request completes.</span>
                         </div>
                     </label>
+                    <div class="toggle-grid">
+                        <label class="toggle"><input id="ocr-toggle" type="checkbox" checked /> <span>OCR</span></label>
+                        <label class="toggle"><input id="lp-toggle" type="checkbox" checked /> <span>License plate</span></label>
+                        <label class="toggle"><input id="seatbelt-toggle" type="checkbox" checked /> <span>Seatbelt</span></label>
+                    </div>
                     <div class="controls">
                         <button class="button" id="submit-btn" type="submit">Process upload</button>
                         <span class="hint" id="file-name">No file selected</span>
@@ -712,6 +825,9 @@ def build_page() -> str:
         const submitBtn = document.getElementById('submit-btn');
         const fileName = document.getElementById('file-name');
         const downloadLink = document.getElementById('download-link');
+        const ocrToggle = document.getElementById('ocr-toggle');
+        const lpToggle = document.getElementById('lp-toggle');
+        const seatbeltToggle = document.getElementById('seatbelt-toggle');
         let currentObjectUrl = null;
         let progressTimer = null;
         let progressValue = 0;
@@ -803,6 +919,9 @@ def build_page() -> str:
             try {
                 const formData = new FormData();
                 formData.append('file', file);
+                formData.append('enable_ocr', ocrToggle.checked ? '1' : '0');
+                formData.append('enable_license_plate', lpToggle.checked ? '1' : '0');
+                formData.append('enable_seatbelt', seatbeltToggle.checked ? '1' : '0');
                 const response = await fetch('/process', { method: 'POST', body: formData });
 
                 if (!response.ok) {
@@ -908,11 +1027,19 @@ def fastapi_app():
         return Response(status_code=204)
 
     @web_app.post("/process")
-    async def process(file: UploadFile = File(...)):
+    async def process(
+        file: UploadFile = File(...),
+        enable_ocr: str = Form("1"),
+        enable_license_plate: str = Form("1"),
+        enable_seatbelt: str = Form("1"),
+    ):
         filename = file.filename or "upload"
         suffix = Path(filename).suffix.lower()
         content_type = (file.content_type or "").lower()
         payload = await file.read()
+        ocr_enabled = _parse_flag(enable_ocr)
+        lp_enabled = _parse_flag(enable_license_plate)
+        seatbelt_enabled = _parse_flag(enable_seatbelt)
 
         is_image = content_type.startswith("image/") or suffix in {
             ".jpg", ".jpeg", ".png", ".webp", ".bmp"
@@ -937,7 +1064,11 @@ def fastapi_app():
                 "result_path": None,
                 "error": None,
             })
-            threading.Thread(target=_run_image_job, args=(job_id, payload, filename), daemon=True).start()
+            threading.Thread(
+                target=_run_image_job,
+                args=(job_id, payload, filename, seatbelt_enabled, lp_enabled, ocr_enabled),
+                daemon=True,
+            ).start()
             return JSONResponse({"job_id": job_id, "type": "image", "total_frames": 1})
 
         if is_video:
@@ -955,7 +1086,11 @@ def fastapi_app():
                 "result_path": None,
                 "error": None,
             })
-            threading.Thread(target=_run_video_job, args=(job_id, payload, filename), daemon=True).start()
+            threading.Thread(
+                target=_run_video_job,
+                args=(job_id, payload, filename, seatbelt_enabled, lp_enabled, ocr_enabled),
+                daemon=True,
+            ).start()
             return JSONResponse({"job_id": job_id, "type": "video", "total_frames": total_frames})
 
         raise HTTPException(
