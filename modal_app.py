@@ -417,6 +417,62 @@ def build_page() -> str:
 
         .status strong { color: var(--text); }
 
+        .progress-wrap {
+            display: none;
+            gap: 8px;
+            padding: 14px 16px;
+            border-radius: 18px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--card-border);
+        }
+
+        .progress-row {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: center;
+            font-size: 0.92rem;
+            color: var(--muted);
+        }
+
+        .progress-track {
+            position: relative;
+            height: 12px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.08);
+        }
+
+        .progress-fill {
+            position: absolute;
+            inset: 0 auto 0 0;
+            width: 0%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #60a5fa, #22c55e, #93c5fd);
+            transition: width 180ms ease;
+            box-shadow: 0 0 22px rgba(96, 165, 250, 0.35);
+        }
+
+        .progress-fill.indeterminate {
+            width: 35%;
+            animation: progress-sweep 1.15s ease-in-out infinite;
+            transform-origin: left center;
+        }
+
+        @keyframes progress-sweep {
+            0% { transform: translateX(-120%); }
+            100% { transform: translateX(300%); }
+        }
+
+        .processing .status {
+            border-color: rgba(96, 165, 250, 0.35);
+        }
+
+        .processing .progress-wrap {
+            display: grid;
+        }
+
         .preview {
             width: 100%;
             max-height: 640px;
@@ -502,6 +558,15 @@ def build_page() -> str:
                 <div class="status" id="status-box">
                     <span>Waiting for a file.</span>
                 </div>
+                <div class="progress-wrap" id="progress-wrap" aria-hidden="true">
+                    <div class="progress-row">
+                        <span id="progress-label">Processing upload...</span>
+                        <span id="progress-percent">0%</span>
+                    </div>
+                    <div class="progress-track" aria-label="Processing progress">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                </div>
                 <div class="preview" id="preview">
                     <div class="hint" style="padding: 24px; text-align: center;">Your processed media will appear here.</div>
                 </div>
@@ -515,11 +580,17 @@ def build_page() -> str:
         const input = document.getElementById('file-input');
         const dropzone = document.getElementById('dropzone');
         const statusBox = document.getElementById('status-box');
+        const progressWrap = document.getElementById('progress-wrap');
+        const progressFill = document.getElementById('progress-fill');
+        const progressLabel = document.getElementById('progress-label');
+        const progressPercent = document.getElementById('progress-percent');
         const preview = document.getElementById('preview');
         const submitBtn = document.getElementById('submit-btn');
         const fileName = document.getElementById('file-name');
         const downloadLink = document.getElementById('download-link');
         let currentObjectUrl = null;
+        let progressTimer = null;
+        let progressValue = 0;
 
         function clearPreview() {
             if (currentObjectUrl) {
@@ -531,6 +602,61 @@ def build_page() -> str:
             downloadLink.href = '#';
         }
 
+        function showProgress(message) {
+            document.body.classList.add('processing');
+            progressLabel.textContent = message;
+            progressPercent.textContent = '0%';
+            progressFill.classList.add('indeterminate');
+            progressFill.style.width = '35%';
+            progressWrap.setAttribute('aria-hidden', 'false');
+            progressWrap.style.display = 'grid';
+
+            progressValue = 0;
+            if (progressTimer) {
+                clearInterval(progressTimer);
+            }
+            progressTimer = setInterval(() => {
+                progressValue = Math.min(progressValue + 4, 92);
+                progressFill.classList.remove('indeterminate');
+                progressFill.style.width = `${progressValue}%`;
+                progressPercent.textContent = `${progressValue}%`;
+            }, 250);
+        }
+
+        function finishProgress(message = 'Complete') {
+            if (progressTimer) {
+                clearInterval(progressTimer);
+                progressTimer = null;
+            }
+            progressFill.classList.remove('indeterminate');
+            progressFill.style.width = '100%';
+            progressPercent.textContent = '100%';
+            progressLabel.textContent = message;
+
+            window.setTimeout(() => {
+                document.body.classList.remove('processing');
+                progressWrap.style.display = 'none';
+                progressWrap.setAttribute('aria-hidden', 'true');
+                progressFill.style.width = '0%';
+                progressPercent.textContent = '0%';
+                progressLabel.textContent = 'Processing upload...';
+            }, 450);
+        }
+
+        function resetProgress() {
+            if (progressTimer) {
+                clearInterval(progressTimer);
+                progressTimer = null;
+            }
+            document.body.classList.remove('processing');
+            progressWrap.style.display = 'none';
+            progressWrap.setAttribute('aria-hidden', 'true');
+            progressFill.classList.remove('indeterminate');
+            progressFill.style.width = '0%';
+            progressPercent.textContent = '0%';
+            progressLabel.textContent = 'Processing upload...';
+        }
+
         function setStatus(message, kind = 'idle') {
             const accent = kind === 'error' ? '#f59e0b' : kind === 'busy' ? '#60a5fa' : '#97a6c4';
             statusBox.innerHTML = `<span style="color:${accent}; font-weight:700;">${message}</span>`;
@@ -540,6 +666,7 @@ def build_page() -> str:
             const file = input.files && input.files[0];
             fileName.textContent = file ? file.name : 'No file selected';
             clearPreview();
+            resetProgress();
             if (file) {
                 setStatus(`Ready to process ${file.name}.`);
             }
@@ -580,6 +707,7 @@ def build_page() -> str:
 
             submitBtn.disabled = true;
             setStatus('Processing on the deployed model...', 'busy');
+            showProgress('Processing upload...');
 
             try {
                 const formData = new FormData();
@@ -623,8 +751,10 @@ def build_page() -> str:
                 downloadLink.href = objectUrl;
                 downloadLink.download = file.name.replace(/\\.[^.]+$/, '') + '_processed' + extension;
                 downloadLink.style.display = 'inline-flex';
+                finishProgress('Ready to download');
                 setStatus('Processing complete.', 'idle');
             } catch (error) {
+                resetProgress();
                 clearPreview();
                 setStatus(error.message || 'Processing failed.', 'error');
             } finally {
