@@ -1,42 +1,10 @@
 #!/usr/bin/env python3
 """
-Vehicle → Seatbelt + Egyptian License-Plate detection pipeline (YOLO11).
+Vehicle, seatbelt, and Egyptian license-plate detection pipeline.
 
-Three-stage, per-vehicle detection with decoupled display/inference threads:
-
-    Stage 1  Car model       → vehicle boxes on the full frame
-    Stage 2  Seatbelt model  → seatbelt / no-seatbelt on each vehicle crop
-    Stage 3  LP model        → plate boxes on each vehicle crop
-             EasyOCR (Arabic) → plate text, tracked across frames
-
-Architecture
-------------
-* Display thread (main) : reads every frame and shows it immediately at source
-                          FPS, overlaying the latest available detections —
-                          playback stays smooth even when inference is slow.
-* Inference thread      : runs the full pipeline on the freshest frame only
-                          (a 1-slot queue drops stale frames automatically).
-
-Key design choices that make this fast and correct
----------------------------------------------------
-* Batched sub-model inference: all vehicle crops are sent to the seatbelt and
-  LP models in ONE call each, instead of one call per vehicle. This is the main
-  reason CUDA now beats CPU — tiny per-crop calls were dominated by launch/
-  transfer overhead and left the GPU idle.
-* PlateTracker: OCR is expensive, so it runs only every N frames. Detected
-  plates are matched to previous ones by proximity, and the last good OCR text
-  follows the plate as the car moves — so the text stays on screen instead of
-  flickering for a single frame.
-* Single PIL pass per frame for Arabic text rendering, instead of a full-frame
-  color conversion per plate.
-
-Example
--------
-python detect_objects.py --input input_2.mp4 --show-live --show-original \
-       --fullscreen --imgsz 320 --realtime
-  --car-weights CarDetectionModel.pt  switch to the KITTI fine-tuned detector
-  --no-lp                             disable license-plate detection
-  --no-ocr                            detect plates but skip OCR (faster)
+The script runs vehicle detection first, then runs seatbelt and plate models on
+vehicle crops. OCR text is tracked across frames so plate text stays visible
+without running OCR on every frame.
 """
 
 import argparse
@@ -54,7 +22,7 @@ import torch
 from ultralytics import YOLO
 from PIL import Image, ImageDraw, ImageFont
 
-# ── Optional dependencies ──────────────────────────────────────────────────────
+# Optional dependencies
 try:
     import easyocr
     EASYOCR_AVAILABLE = True
@@ -71,16 +39,13 @@ except ImportError:
     print("[WARN] arabic_reshaper / python-bidi not installed; Arabic may render reversed.")
     print("       Run: pip install arabic-reshaper python-bidi")
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Constants
-# ════════════════════════════════════════════════════════════════════════════
 SEATBELT_COLORS = {
-    'seatbelt':    (0, 200, 0),    # green  — belt detected
-    'no-seatbelt': (0, 0, 220),    # red    — no belt
+    'seatbelt':    (0, 200, 0),    # green: belt detected
+    'no-seatbelt': (0, 0, 220),    # red: no belt
 }
-NO_DETECTION_COLOR = (0, 140, 255)  # orange — vehicle found but no seatbelt result
-LP_BOX_COLOR       = (0, 220, 255)  # yellow — license-plate box
+NO_DETECTION_COLOR = (0, 140, 255)  # orange: vehicle found but no seatbelt result
+LP_BOX_COLOR       = (0, 220, 255)  # yellow: license-plate box
 LP_TEXT_BG_COLOR   = (20, 20, 20)   # dark background behind plate text
 
 # Fonts tried (in order) for rendering Arabic plate text.
@@ -106,10 +71,7 @@ SEATBELT_LABEL_MAP = {
     'windshield': None,
 }
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Data structures
-# ════════════════════════════════════════════════════════════════════════════
 Box = Tuple[float, float, float, float]
 
 
@@ -130,22 +92,19 @@ class Detection:
     seatbelt: Optional[Tuple[str, float]] = None   # (label, conf)
     plates: List[Plate] = field(default_factory=list)
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Arabic text rendering (PIL)
-# ════════════════════════════════════════════════════════════════════════════
 class ArabicTextRenderer:
-    """Renders UTF-8 / Arabic strings onto BGR frames using PIL.
+    """Draws Arabic and UTF-8 labels on OpenCV frames using PIL.
 
-    OpenCV's putText cannot draw Arabic, so we composite text via PIL. To keep
-    it cheap, all text labels for a frame are drawn in a SINGLE conversion
-    pass (BGR→PIL→BGR once per frame, not once per label).
+    OpenCV text cannot shape Arabic correctly, so labels are rendered with PIL.
     """
 
     def __init__(self) -> None:
+        """Create a font cache so repeated label drawing stays fast."""
         self._font_cache: dict = {}
 
     def _font(self, size: int) -> ImageFont.FreeTypeFont:
+        """Return a cached font for the requested size."""
         if size not in self._font_cache:
             font = None
             for path in _FONT_CANDIDATES:
@@ -160,7 +119,7 @@ class ArabicTextRenderer:
 
     @staticmethod
     def _shape(text: str) -> str:
-        """Reshape + apply BiDi so Arabic glyphs connect and order correctly."""
+        """Shape Arabic text so glyphs connect and display in the right order."""
         if text and ARABIC_RENDER_AVAILABLE:
             try:
                 return get_display(arabic_reshaper.reshape(text))
@@ -174,7 +133,7 @@ class ArabicTextRenderer:
                     text_color=(255, 255, 255),
                     bg_color=LP_TEXT_BG_COLOR,
                     padding: int = 4) -> np.ndarray:
-        """Draw a list of (text, x, y) labels in one pass. Returns new frame."""
+        """Draw all queued text labels with one PIL conversion pass."""
         if not labels:
             return frame_bgr
 
@@ -187,7 +146,7 @@ class ArabicTextRenderer:
             text = self._shape(text)
             bbox = draw.textbbox((0, 0), text, font=font)
             tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-            # Clamp so the label stays fully inside the frame.
+            # Clamp label position so the text box stays inside the frame.
             x = max(0, min(x, w - tw - padding * 2))
             y = max(0, min(y, h - th - padding * 2))
             draw.rectangle([x, y, x + tw + padding * 2, y + th + padding * 2], fill=bg_color)
@@ -195,32 +154,25 @@ class ArabicTextRenderer:
 
         return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# Plate tracker — keeps OCR text on screen as the plate moves
-# ════════════════════════════════════════════════════════════════════════════
+# Plate tracking
 class PlateTracker:
-    """Associates plate detections across frames by proximity.
-
-    OCR runs only every few frames (it is slow). Between runs, we match each
-    new plate box to the nearest known plate and reuse its last *non-empty*
-    text. This is what keeps the plate text visible instead of flashing for a
-    single frame — the previous keying-by-exact-coordinates approach never hit
-    because a moving plate shifts every frame.
-    """
+    """Tracks plate boxes so OCR text can follow moving plates between reads."""
 
     def __init__(self, ttl: int = 45) -> None:
+        """Create an empty track list with a frame-based time-to-live."""
         self._tracks: List[dict] = []   # {box, text, age, last_ocr_frame}
         self._ttl = ttl                 # frames a track survives without a match
 
     @staticmethod
     def _center(box: Box) -> Tuple[float, float]:
+        """Return the center point of a bounding box."""
         return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
 
     def _find_match(self, box: Box) -> Optional[dict]:
+        """Find the nearest recent plate track for the current box."""
         cx, cy = self._center(box)
         width = box[2] - box[0]
-        # Match radius scales with plate size; min 40 px for tiny far plates.
+        # Wider plates can move farther between frames; tiny plates still get 40 px.
         max_dist = max(40.0, 0.9 * width)
 
         best, best_dist = None, float('inf')
@@ -238,6 +190,7 @@ class PlateTracker:
 
     @staticmethod
     def _should_ocr(track: Optional[dict], frame_idx: int, every: int) -> bool:
+        """Decide whether OCR should run for this plate on this frame."""
         if track is None:
             return True
         last = track.get('last_ocr_frame')
@@ -247,6 +200,7 @@ class PlateTracker:
 
     def update(self, box: Box, track: Optional[dict], new_text: str,
                frame_idx: int, ocr_ran: bool) -> str:
+        """Update a plate track and return the text that should be displayed."""
         if track is None:
             self._tracks.append({
                 'box': box,
@@ -272,27 +226,19 @@ class PlateTracker:
         return track['text']
 
     def end_frame(self) -> None:
-        """Age all tracks and drop ones not seen for `ttl` frames."""
+        """Age every track and remove tracks that have been missing too long."""
         for track in self._tracks:
             track['age'] += 1
         self._tracks = [t for t in self._tracks if t['age'] <= self._ttl]
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Detection pipeline
-# ════════════════════════════════════════════════════════════════════════════
 class DetectionPipeline:
-    """Runs car → seatbelt → license-plate → OCR on a single frame.
-
-    All sub-model inference is BATCHED: every vehicle crop is sent to the
-    seatbelt and LP models in one call each, regardless of how many vehicles
-    are present. This keeps the GPU busy and is the key to CUDA outperforming
-    CPU on this workload.
-    """
+    """Runs vehicle, seatbelt, plate, and OCR inference on one frame."""
 
     def __init__(self, car_model, seatbelt_model, lp_model, ocr_reader,
                  vehicle_classes, conf, iou, device, imgsz, sub_imgsz,
                  ocr_every, max_vehicles=8, profile=False):
+        """Store model objects, inference settings, and per-stream state."""
         self.car_model = car_model
         self.seatbelt_model = seatbelt_model
         self.lp_model = lp_model
@@ -311,31 +257,27 @@ class DetectionPipeline:
         self.car_names = car_model.names
         self._tracker = PlateTracker()
         self._frame_idx = 0
-        # Blank tile used to pad sub-model batches to a constant size (see infer).
-        self._pad_tile = np.zeros((sub_imgsz, sub_imgsz, 3), dtype=np.uint8)
+        # Used to keep sub-model batch size constant even with fewer vehicles.
+        self._pad_tile = np.zeros((sub_imgsz, sub_imgsz, 3), dtype=np.uint8) # 
 
-    # ── Common predict wrapper ────────────────────────────────────────────────
     def _predict(self, model, source, imgsz=None):
+        """Run one Ultralytics prediction call with shared thresholds/settings."""
         return model.predict(
             source, conf=self.conf, iou=self.iou, imgsz=imgsz or self.imgsz,
             device=self.device, half=self.half, verbose=False,
         )
 
     def warmup(self) -> None:
-        """Run dummy inferences so CUDA/cuDNN tune for the exact shapes used at
-        run time. Critically, the sub-models are warmed at the FULL fixed batch
-        size (max_vehicles) — the same shape infer() always feeds them — so the
-        one-time per-shape tuning cost is paid here, not as a spike mid-video."""
+        """Run dummy inference so CUDA/cuDNN prepares the shapes used later."""
         big = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
-        batch = [self._pad_tile] * self.max_vehicles
+        batch = [self._pad_tile] * self.max_vehicles  # full padded batch shape
         self._predict(self.car_model, big, self.imgsz)
         for model in (self.seatbelt_model, self.lp_model):
             if model is not None:
                 self._predict(model, batch, self.sub_imgsz)
 
         if self.ocr_reader is not None:
-            # Warm OCR on blank and plate-like crops so the first real plate does
-            # not pay EasyOCR's lazy recognition/setup cost.
+            # Warm OCR on blank and plate-like crops before the first real plate.
             try:
                 blank = np.zeros((48, 192, 3), dtype=np.uint8)
                 plate_like = np.full((64, 240, 3), 235, dtype=np.uint8)
@@ -360,11 +302,9 @@ class DetectionPipeline:
         self._tracker = PlateTracker()
         self._frame_idx = 0
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
     @staticmethod
     def _clip_crop(frame, x1, y1, x2, y2):
-        """Return (crop, (x_offset, y_offset)) clipped to frame bounds, or
-        (None, None) if the region is empty."""
+        """Clip a crop to frame bounds and return the crop plus its offset."""
         h, w = frame.shape[:2]
         cx1, cy1 = max(0, int(x1)), max(0, int(y1))
         cx2, cy2 = min(w, int(x2)), min(h, int(y2))
@@ -374,13 +314,14 @@ class DetectionPipeline:
 
     @staticmethod
     def _normalize_seatbelt_label(label: str) -> Optional[str]:
+        """Map raw model labels into the two labels used by the renderer."""
         key = label.strip().lower()
         if key in SEATBELT_LABEL_MAP:
             return SEATBELT_LABEL_MAP[key]
         return None
 
     def _best_label(self, result, model, label_normalizer=None) -> Optional[Tuple[str, float]]:
-        """Highest-confidence (label, conf) from a Results object, or None."""
+        """Return the highest-confidence usable label from one model result."""
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             return None
@@ -402,14 +343,13 @@ class DetectionPipeline:
         return best_label, best_conf
 
     def _ocr(self, frame, box: Box) -> str:
-        """Run EasyOCR on a plate crop (CPU). Egyptian plates: Arabic letters
-        + numerals (RTL). Returns joined text or ''."""
+        """Run EasyOCR on a plate crop and return joined text, or empty text."""
         if self.ocr_reader is None:
             return ""
         crop, _ = self._clip_crop(frame, *box)
         if crop is None:
             return ""
-        # Upscale small plates — OCR accuracy drops sharply below ~32 px tall.
+        # Upscale tiny plate crops because OCR is weak below about 32 px tall.
         ch = crop.shape[0]
         if ch < 32:
             scale = 32 / ch
@@ -420,20 +360,14 @@ class DetectionPipeline:
         except Exception:
             return ""
 
-    # ── Main entry ────────────────────────────────────────────────────────────
     def infer(self, frame, force_ocr: bool = False) -> List[Detection]:
-        """Full pipeline on one frame → list of Detection.
-
-        When `force_ocr` is True, OCR runs regardless of the frame counter.
-        This is useful for single-image uploads, which would otherwise only
-        run OCR every `ocr_every` frames.
-        """
+        """Run the full frame pipeline and return vehicle detections."""
         self._frame_idx += 1
         t = time.perf_counter
         t_car = t_sb = t_lp = t_ocr = 0.0
         ocr_runs = 0
 
-        # Stage 1 — vehicle detection on the full frame.
+        # Stage 1: detect vehicles on the full frame.
         t0 = t()
         car_result = self._predict(self.car_model, frame, self.imgsz)[0]
         t_car = t() - t0
@@ -443,11 +377,10 @@ class DetectionPipeline:
         crop_meta: List[Tuple[int, int, int]] = []   # (detection_idx, x_off, y_off)
 
         if car_result.boxes is not None:
-            # Process the largest/closest vehicles first, capped at max_vehicles —
-            # bounds the per-frame sub-model + OCR cost in busy scenes.
+            # Sort largest vehicles first, then cap sub-model work for busy frames.
             boxes_sorted = sorted(
                 car_result.boxes,
-                key=lambda b: (b.xyxy[0][2] - b.xyxy[0][0]) * (b.xyxy[0][3] - b.xyxy[0][1]),
+                key=lambda b: (b.xyxy[0][2] - b.xyxy[0][0]) * (b.xyxy[0][3] - b.xyxy[0][1]),  # box area
                 reverse=True,
             )
             for box in boxes_sorted:
@@ -460,21 +393,18 @@ class DetectionPipeline:
                                 cls=cls, name=name)
                 detections.append(det)
 
-                # Only crop vehicles we care about (saves sub-model work).
+                # Only crop target vehicle classes, then send crops to sub-models.
                 if name.lower() in self.vehicle_classes and len(crops) < self.max_vehicles:
                     crop, offset = self._clip_crop(frame, x1, y1, x2, y2)
                     if crop is not None:
                         crops.append(crop)
                         crop_meta.append((len(detections) - 1, offset[0], offset[1]))
 
-        # Pad the crop list to a CONSTANT batch size with blank tiles. Sub-models
-        # then always receive the same input shape, so cuDNN tunes once (at
-        # warmup) instead of re-tuning on every batch-size change — which caused
-        # the 1.5–3 s spikes. Padded results are sliced off via [:n_real].
+        # Pad crops so sub-models always receive the same batch shape.
         n_real = len(crops)
-        batch = (crops + [self._pad_tile] * (self.max_vehicles - n_real)) if n_real else None
+        batch = (crops + [self._pad_tile] * (self.max_vehicles - n_real)) if n_real else None  # padded rows are ignored
 
-        # Stage 2 — seatbelt on the fixed-size batch (at sub_imgsz).
+        # Stage 2: run seatbelt detection on the fixed-size crop batch.
         if batch is not None and self.seatbelt_model is not None:
             t0 = t()
             results = self._predict(self.seatbelt_model, batch, self.sub_imgsz)[:n_real]
@@ -486,7 +416,7 @@ class DetectionPipeline:
                 )
             t_sb = t() - t0
 
-        # Stage 3 — license plates on the fixed-size batch (at sub_imgsz).
+        # Stage 3: detect license plates on the same crop batch.
         n_plates = 0
         if batch is not None and self.lp_model is not None:
             t0 = t()
@@ -497,7 +427,7 @@ class DetectionPipeline:
                     continue
                 for pbox in result.boxes:
                     px1, py1, px2, py2 = pbox.xyxy[0].tolist()
-                    # Translate crop-relative coords back to full-frame coords.
+                    # Convert crop coordinates back into full-frame coordinates.
                     full_box: Box = (px1 + ox, py1 + oy, px2 + ox, py2 + oy)
                     n_plates += 1
                     track = self._tracker._find_match(full_box)
@@ -524,24 +454,17 @@ class DetectionPipeline:
 
         return detections
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Rendering
-# ════════════════════════════════════════════════════════════════════════════
 def draw_detections(frame, detections: List[Detection],
                     text_renderer: ArabicTextRenderer) -> np.ndarray:
-    """Draw vehicle boxes, car/seatbelt labels, and plate boxes + OCR text.
-
-    All OpenCV primitives are drawn first; Arabic plate text is composited in a
-    single PIL pass at the end for efficiency.
-    """
+    """Draw detection boxes and labels on a frame."""
     plate_labels: List[Tuple[str, int, int]] = []
 
     for det in detections:
         x1, y1, x2, y2 = map(int, det.box)
         name = det.name or "Vehicle"
 
-        # Vehicle box color reflects seatbelt status.
+        # Pick vehicle color from seatbelt status.
         if det.seatbelt is not None:
             sb_label, sb_conf = det.seatbelt
             color = SEATBELT_COLORS.get(sb_label, NO_DETECTION_COLOR)
@@ -551,7 +474,7 @@ def draw_detections(frame, detections: List[Detection],
 
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-        # Car label — above the box.
+        # Draw car label above the vehicle box.
         car_text = f"{name} {round(det.conf, 1):.1f}"
         (tw, tht), base = cv2.getTextSize(car_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
         top = max(0, y1 - tht - 8)
@@ -559,7 +482,7 @@ def draw_detections(frame, detections: List[Detection],
         cv2.putText(frame, car_text, (x1, top + tht),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        # Seatbelt label — bottom-left of the box.
+        # Draw seatbelt label at the bottom-left of the vehicle box.
         if sb_label is not None:
             sb_text = f"{sb_label} {round(sb_conf, 1):.1f}"
             (sw, sh), _ = cv2.getTextSize(sb_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
@@ -568,7 +491,7 @@ def draw_detections(frame, detections: List[Detection],
             cv2.putText(frame, sb_text, (x1, sb_top + sh),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
-        # Plate boxes (drawn now) + text (queued for the single PIL pass).
+        # Draw plate boxes now and queue OCR text for one PIL pass later.
         for plate in det.plates:
             px1, py1, px2, py2 = map(int, plate.box)
             cv2.rectangle(frame, (px1, py1), (px2, py2), LP_BOX_COLOR, 2)
@@ -577,12 +500,9 @@ def draw_detections(frame, detections: List[Detection],
 
     return text_renderer.draw_labels(frame, plate_labels)
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Display helpers
-# ════════════════════════════════════════════════════════════════════════════
 def get_screen_resolution(default=(1280, 720)) -> Tuple[int, int]:
-    """Best-effort screen size for fullscreen layout (falls back to default)."""
+    """Return screen size for fullscreen layout, or a default fallback."""
     try:
         import tkinter as tk
         root = tk.Tk()
@@ -595,20 +515,17 @@ def get_screen_resolution(default=(1280, 720)) -> Tuple[int, int]:
         pass
     return default
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Threaded video application
-# ════════════════════════════════════════════════════════════════════════════
 class VideoApp:
-    """Decoupled display (main thread) + inference (worker thread) player."""
+    """Runs video display in the main thread and inference in a worker thread."""
 
-    # ASCII-only title: a non-ASCII char (e.g. '·') makes OpenCV on Windows
-    # encode the name differently in namedWindow vs imshow, opening two windows.
+    # Keep the window title ASCII so OpenCV uses the same name on Windows.
     WINDOW_NAME = 'Vehicle - Seatbelt - Plate Detection'
 
     def __init__(self, pipeline: DetectionPipeline, input_path, output_path,
                  show_live, show_original, save_output, display_size,
                  fullscreen, realtime, frame_skip, text_renderer):
+        """Store playback options and initialize shared thread state."""
         self.pipeline = pipeline
         self.input_path = input_path
         self.output_path = output_path
@@ -621,20 +538,21 @@ class VideoApp:
         self.frame_skip = max(1, frame_skip)   # enqueue 1 of every N frames for inference
         self.text_renderer = text_renderer
 
-        # Shared state between threads.
+        # Shared inference state protected by a lock.
         self._detections: List[Detection] = []
         self._lock = threading.Lock()
         self._infer_count = 0
-        self._infer_queue: queue.Queue = queue.Queue(maxsize=1)  # 1 slot → drop stale
+        self._infer_queue: queue.Queue = queue.Queue(maxsize=1)  # one slot drops stale frames
         self._stop = threading.Event()
 
-        # Playback state (main thread only).
+        # Playback state used only by the main thread.
         self._frame_count = 0
         self._start_time = 0.0
         self._last_frame_time = 0.0
         self._paused = False
 
     def _prepare_inference(self) -> None:
+        """Initialize CUDA when needed and warm all models before playback."""
         if self.pipeline.device == 'cuda':
             torch.cuda.init()
             torch.backends.cudnn.benchmark = False
@@ -643,7 +561,7 @@ class VideoApp:
         print("done.")
 
     def _prime_video_start(self) -> None:
-        """Pay first real-frame inference cost before the playback window opens."""
+        """Run one real frame before opening the playback window."""
         cap = cv2.VideoCapture(self.input_path)
         if not cap.isOpened():
             return
@@ -655,13 +573,13 @@ class VideoApp:
             cap.release()
             self.pipeline.reset_temporal_state()
 
-    # ── Inference worker ──────────────────────────────────────────────────────
     def _inference_worker(self, ready_event: threading.Event):
-        # 1. Initialize CUDA in this worker thread and warm models before playback.
+        """Consume fresh frames from the queue and publish detections."""
+        # Initialize CUDA in this worker thread and warm models before playback.
         self._prepare_inference()
         self._prime_video_start()
 
-        # 2. Signal the main thread that warmup is finished and playback can start.
+        # Signal the main thread that warmup is finished and playback can start.
         ready_event.set()
 
         while not self._stop.is_set():
@@ -689,8 +607,8 @@ class VideoApp:
         with self._lock:
             self._detections = []
 
-    # ── Display composition ───────────────────────────────────────────────────
     def _compose(self, original, annotated, screen):
+        """Resize and combine original/annotated views for display."""
         if self.fullscreen:
             sw, sh = screen
             pw = max(1, sw // 2) if self.show_original else max(1, sw)
@@ -703,6 +621,7 @@ class VideoApp:
         return cv2.hconcat([cv2.resize(original, (pw, ph)), ann])
 
     def _run_image(self):
+        """Run the pipeline once for a still image input."""
         frame = cv2.imread(self.input_path)
         if frame is None:
             raise ValueError(f"Error opening image: {self.input_path}")
@@ -730,6 +649,7 @@ class VideoApp:
             cv2.destroyAllWindows()
 
     def _fps(self):
+        """Return display FPS and inference FPS based on elapsed time."""
         elapsed = time.time() - self._start_time
         if elapsed <= 0:
             return 0.0, 0.0
@@ -738,6 +658,7 @@ class VideoApp:
         return self._frame_count / elapsed, ic / elapsed
 
     def _draw_hud(self, disp, status=""):
+        """Draw playback and inference stats on the display frame."""
         stream_fps, infer_fps = self._fps()
         cv2.rectangle(disp, (10, 10), (700, 110 if status else 100), (0, 0, 0), cv2.FILLED)
         cv2.putText(disp, f"Stream FPS: {stream_fps:.2f}", (18, 35),
@@ -750,9 +671,8 @@ class VideoApp:
             cv2.putText(disp, status, (520, 35),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
 
-    # ── Keyboard ──────────────────────────────────────────────────────────────
     def _handle_key(self, cap, key, seek_step) -> bool:
-        """Return False to quit."""
+        """Handle playback hotkeys and return False when playback should stop."""
         if key == ord('q'):
             return False
         if key == ord(' '):
@@ -775,8 +695,8 @@ class VideoApp:
             self._flush_inference()
         return True
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
     def run(self):
+        """Run image mode or video playback mode from the selected input."""
         if os.path.splitext(self.input_path)[1].lower() in _IMAGE_EXTS:
             return self._run_image()
 
@@ -796,10 +716,7 @@ class VideoApp:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(self.output_path, fourcc, fps, (fw, fh))
 
-        # Start the inference thread. It initialises CUDA, warms up all models,
-        # then sets ready_event. The main thread blocks here until warmup is
-        # complete — so the video window only opens when inference is fully ready
-        # and frame #1 will already have fast detection instead of 0 FPS.
+        # Start worker first so playback opens after warmup is complete.
         ready_event = threading.Event()
         worker = threading.Thread(target=self._inference_worker,
                                   args=(ready_event,), daemon=True)
@@ -818,18 +735,12 @@ class VideoApp:
         last_frame = None      # last decoded raw frame
         last_infer_seen = -1   # _infer_count value when we last redrew
 
-        # Always pace display to video FPS regardless of --realtime flag.
-        # Letting the display run uncapped (e.g. 196 FPS) makes draw_detections
-        # (with its PIL pass) dominate the main thread and starves the GPU,
-        # cutting inference FPS roughly in half.
+        # Pace display to source FPS so drawing does not starve inference.
         display_interval = 1.0 / fps if fps > 0 else 1.0 / 30.0
 
         try:
             while True:
-                # ── Paused: keep refining the current frame ────────────────────
-                # Feed the same frame repeatedly so inference keeps running and
-                # OCR fires (every N frames). Redraw only when a new inference
-                # result arrives so the PIL pass isn't wasted.
+                # While paused, keep refining the same frame and redraw on new results.
                 if self._paused:
                     if last_frame is not None:
                         try:
@@ -839,7 +750,7 @@ class VideoApp:
                         with self._lock:
                             ic = self._infer_count
                             detections = self._detections
-                        if ic != last_infer_seen:   # new result → redraw
+                        if ic != last_infer_seen:   # redraw only for a new inference result
                             annotated = draw_detections(last_frame.copy(), detections,
                                                         self.text_renderer)
                             last_infer_seen = ic
@@ -857,17 +768,14 @@ class VideoApp:
                 self._frame_count += 1
                 last_frame = frame
 
-                # Hand the freshest frame to inference (non-blocking; 1-slot
-                # queue drops it if the worker is still busy).
+                # Queue the newest frame; a full queue means the worker is busy.
                 if self._frame_count % self.frame_skip == 0:
                     try:
                         self._infer_queue.put_nowait(frame.copy())
                     except queue.Full:
                         pass
 
-                # Only redraw the overlay when a new inference result is ready.
-                # This means draw_detections (PIL pass) runs at inference FPS,
-                # not display FPS — removing the main source of GPU contention.
+                # Redraw overlays only when a new inference result is ready.
                 with self._lock:
                     ic = self._infer_count
                     detections = self._detections
@@ -887,7 +795,7 @@ class VideoApp:
                     if not self._handle_key(cap, cv2.waitKey(1) & 0xFF, seek_step):
                         break
 
-                # Pace display to video FPS (always on, replaces --realtime flag).
+                # Sleep until the next source-FPS display slot.
                 target = self._last_frame_time + display_interval
                 now = time.time()
                 if now < target:
@@ -910,15 +818,13 @@ class VideoApp:
         if self.save_output:
             print(f"Done. Output saved to: {self.output_path}")
 
-
-# ════════════════════════════════════════════════════════════════════════════
 # Entry point
-# ════════════════════════════════════════════════════════════════════════════
 def parse_args():
+    """Parse command-line options for models, input/output, and display."""
     p = argparse.ArgumentParser(
         description='Vehicle detection → seatbelt + Egyptian license plate (OCR)')
     p.add_argument('--input', type=str, required=True)
-    p.add_argument('--output', type=str, required=False)
+    p.add_argument('--output', type=str)
     p.add_argument('--car-weights', type=str, default='yolo11n.pt',
                    help='Car detector. yolo11n.pt (COCO) or CarDetectionModel.pt (KITTI).')
     p.add_argument('--seatbelt-weights', type=str, default='SeatBeltModel2.pt')
@@ -936,10 +842,10 @@ def parse_args():
     p.add_argument('--vehicle-classes', type=str, default='car,van,truck,bus',
                    help='Case-insensitive classes to run sub-models on. '
                         'COCO: car,truck,bus | KITTI: Car,Van,Truck')
-    p.add_argument('--conf-threshold', type=float, default=0.25)
-    p.add_argument('--iou-threshold', type=float, default=0.45)
-    p.add_argument('--show-live', action='store_true')
-    p.add_argument('--show-original', action='store_true')
+    p.add_argument('--conf-threshold', type=float, default=0.25, help='Detection confidence threshold.') 
+    p.add_argument('--iou-threshold', type=float, default=0.45, help='Detection Intersection over Union threshold.')
+    p.add_argument('--show-live', action='store_true', help='Show live video display with detections overlaid.')
+    p.add_argument('--show-original', action='store_true', help='Show original video display.')
     p.add_argument('--device', type=str, choices=['auto', 'cpu', 'cuda'], default='auto')
     p.add_argument('--imgsz', type=int, default=640,
                    help='Image size for full-frame car detection. Default: 640.')
@@ -952,10 +858,10 @@ def parse_args():
                    help='Print per-stage timing (car/seatbelt/LP/OCR ms) each inference.')
     p.add_argument('--frame-skip', type=int, default=1,
                    help='Enqueue 1 of every N frames for inference (display still shows all).')
-    p.add_argument('--no-save', action='store_true')
+    p.add_argument('--no-save', action='store_true', help='Do not save annotated video output.')
     p.add_argument('--display-width', type=int, default=640)
     p.add_argument('--display-height', type=int, default=360)
-    p.add_argument('--fullscreen', action='store_true')
+    p.add_argument('--fullscreen', action='store_true', help='Start in fullscreen mode (press F to toggle during playback).')
     p.add_argument('--realtime', action='store_true',
                    help='Deprecated — display is now always capped to video FPS. '
                         'Kept for backward compatibility.')
@@ -963,6 +869,7 @@ def parse_args():
 
 
 def resolve_device(requested: str) -> str:
+    """Resolve auto/cpu/cuda into the device actually used by the models."""
     if requested == 'auto':
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     elif requested == 'cuda' and not torch.cuda.is_available():
@@ -975,23 +882,23 @@ def resolve_device(requested: str) -> str:
 
 
 def main():
+    """Load models, build the pipeline, and run the video/image app."""
     args = parse_args()
     device = resolve_device(args.device)
 
-    # NOTE on cuDNN: Ultralytics sets torch.backends.cudnn.benchmark = True, which
-    # makes cuDNN re-run an expensive (~1.5–3 s) algorithm search on every new
-    # input shape. We pin it to False (see VideoApp._inference_worker) AND feed the
-    # sub-models a constant batch size, so shapes never change — eliminating the
-    # mid-video spikes entirely.
+    # The worker disables cuDNN benchmark and keeps sub-model batches fixed.
+    # That avoids repeated CUDA algorithm searches when input shapes change.
 
     # Path helpers: bare names resolve under the project's standard folders.
     def resolve_input(name):
+        """Resolve a bare input name under the validation video folder."""
         return name if os.path.dirname(name) else os.path.join('Detection Video Validation', name)
 
     def resolve_model(name):
+        """Resolve a bare model filename under the Models folder."""
         return name if os.path.dirname(name) else os.path.join('Models', name)
 
-    # ── Load models ────────────────────────────────────────────────────────────
+    # Load models.
     car_path = resolve_model(args.car_weights)
     print(f"Loading car model:      {car_path}")
     car_model = YOLO(car_path).to(device)
@@ -1012,17 +919,14 @@ def main():
 
         if not args.no_ocr:
             if EASYOCR_AVAILABLE:
-                # Use the GPU for OCR when available — recognition is much faster
-                # there. Fall back to CPU if the GPU reader fails to initialise
-                # (e.g. limited VRAM), so the pipeline always keeps working.
+                # Prefer GPU OCR when available, then fall back to CPU if needed.
                 if args.ocr_device == 'auto':
                     use_gpu_ocr = (device == 'cuda')
                 else:
                     use_gpu_ocr = (args.ocr_device == 'cuda')
-                print(f"Initialising EasyOCR (Arabic+English, {'GPU' if use_gpu_ocr else 'CPU'})… "
-                      "(first run downloads ~500 MB)")
+                print(f"Initialising EasyOCR (Arabic+English, {'GPU' if use_gpu_ocr else 'CPU'}) ")
                 try:
-                    ocr_reader = easyocr.Reader(['ar', 'en'], gpu=use_gpu_ocr, verbose=False)
+                    ocr_reader = easyocr.Reader(['ar', 'en'], gpu=use_gpu_ocr, verbose=False) # verbose False to suppress EasyOCR's own printouts
                 except Exception as exc:
                     print(f"[WARN] EasyOCR GPU init failed ({exc}); falling back to CPU.")
                     ocr_reader = easyocr.Reader(['ar', 'en'], gpu=False, verbose=False)
@@ -1035,7 +939,7 @@ def main():
     vehicle_classes = {c.strip().lower() for c in args.vehicle_classes.split(',')}
     print(f"Seatbelt/LP on classes (case-insensitive): {vehicle_classes}")
 
-    # ── Resolve paths ──────────────────────────────────────────────────────────
+    # Resolve input/output paths.
     input_path = resolve_input(args.input)
     if args.output:
         output_path = resolve_input(args.output)
@@ -1043,7 +947,7 @@ def main():
         base, ext = os.path.splitext(input_path)
         output_path = f"{base}_annotated{ext}"
 
-    # ── Build pipeline + app and run ───────────────────────────────────────────
+    # Build pipeline and run the app.
     pipeline = DetectionPipeline(
         car_model=car_model, seatbelt_model=seatbelt_model, lp_model=lp_model,
         ocr_reader=ocr_reader, vehicle_classes=vehicle_classes,
