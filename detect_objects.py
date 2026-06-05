@@ -207,18 +207,14 @@ class PlateTracker:
     """
 
     def __init__(self, ttl: int = 45) -> None:
-        self._tracks: List[dict] = []   # {box, text, age}
+        self._tracks: List[dict] = []   # {box, text, age, last_ocr_frame}
         self._ttl = ttl                 # frames a track survives without a match
 
     @staticmethod
     def _center(box: Box) -> Tuple[float, float]:
         return (box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0
 
-    def resolve(self, box: Box, new_text: str) -> str:
-        """Match `box` to a track; update text if `new_text` is non-empty.
-
-        Returns the text that should be displayed for this plate.
-        """
+    def _find_match(self, box: Box) -> Optional[dict]:
         cx, cy = self._center(box)
         width = box[2] - box[0]
         # Match radius scales with plate size; min 40 px for tiny far plates.
@@ -232,15 +228,36 @@ class PlateTracker:
                 best, best_dist = track, dist
 
         if best is not None and best_dist <= max_dist:
-            best['box'] = box
-            best['age'] = 0
-            if new_text:                       # only overwrite with a real read
-                best['text'] = new_text
-            return best['text']
+            return best
+        return None
 
-        # No nearby track → start a new one.
-        self._tracks.append({'box': box, 'text': new_text, 'age': 0})
-        return new_text
+    @staticmethod
+    def _should_ocr(track: Optional[dict], frame_idx: int, every: int) -> bool:
+        if track is None:
+            return True
+        last = track.get('last_ocr_frame')
+        if last is None:
+            return True
+        return (frame_idx - last) >= every
+
+    def update(self, box: Box, track: Optional[dict], new_text: str,
+               frame_idx: int, ocr_ran: bool) -> str:
+        if track is None:
+            self._tracks.append({
+                'box': box,
+                'text': new_text,
+                'age': 0,
+                'last_ocr_frame': frame_idx if ocr_ran else None,
+            })
+            return new_text
+
+        track['box'] = box
+        track['age'] = 0
+        if ocr_ran:
+            track['last_ocr_frame'] = frame_idx
+            if new_text:  # only overwrite with a real read
+                track['text'] = new_text
+        return track['text']
 
     def end_frame(self) -> None:
         """Age all tracks and drop ones not seen for `ttl` frames."""
@@ -373,9 +390,9 @@ class DetectionPipeline:
         run OCR every `ocr_every` frames.
         """
         self._frame_idx += 1
-        run_ocr = force_ocr or (self._frame_idx % self.ocr_every == 0)
         t = time.perf_counter
         t_car = t_sb = t_lp = t_ocr = 0.0
+        ocr_runs = 0
 
         # Stage 1 — vehicle detection on the full frame.
         t0 = t()
@@ -444,10 +461,18 @@ class DetectionPipeline:
                     # Translate crop-relative coords back to full-frame coords.
                     full_box: Box = (px1 + ox, py1 + oy, px2 + ox, py2 + oy)
                     n_plates += 1
+                    track = self._tracker._find_match(full_box)
+                    run_ocr = force_ocr or self._tracker._should_ocr(
+                        track, self._frame_idx, self.ocr_every
+                    )
                     t0 = t()
                     new_text = self._ocr(frame, full_box) if run_ocr else ""
                     t_ocr += t() - t0
-                    text = self._tracker.resolve(full_box, new_text)
+                    if run_ocr:
+                        ocr_runs += 1
+                    text = self._tracker.update(
+                        full_box, track, new_text, self._frame_idx, run_ocr
+                    )
                     detections[idx].plates.append(Plate(box=full_box, text=text))
 
         self._tracker.end_frame()
@@ -455,8 +480,8 @@ class DetectionPipeline:
         if self.profile:
             total = (t_car + t_sb + t_lp + t_ocr) * 1000
             print(f"[infer #{self._frame_idx}] vehicles={len(crops)} plates={n_plates} "
-                  f"ocr={'Y' if run_ocr else 'n'} | car={t_car*1000:.0f} sb={t_sb*1000:.0f} "
-                  f"lp={t_lp*1000:.0f} ocr={t_ocr*1000:.0f} total={total:.0f} ms", flush=True)
+                f"ocr_runs={ocr_runs} | car={t_car*1000:.0f} sb={t_sb*1000:.0f} "
+                f"lp={t_lp*1000:.0f} ocr={t_ocr*1000:.0f} total={total:.0f} ms", flush=True)
 
         return detections
 
@@ -630,7 +655,7 @@ class VideoApp:
             raise ValueError(f"Error opening image: {self.input_path}")
 
         self._prepare_inference()
-        detections = self.pipeline.infer(frame)
+        detections = self.pipeline.infer(frame, force_ocr=True)
         annotated = draw_detections(frame.copy(), detections, self.text_renderer)
 
         if self.save_output:
@@ -941,13 +966,13 @@ def main():
                     use_gpu_ocr = (device == 'cuda')
                 else:
                     use_gpu_ocr = (args.ocr_device == 'cuda')
-                print(f"Initialising EasyOCR (Arabic, {'GPU' if use_gpu_ocr else 'CPU'})… "
+                print(f"Initialising EasyOCR (Arabic+English, {'GPU' if use_gpu_ocr else 'CPU'})… "
                       "(first run downloads ~500 MB)")
                 try:
-                    ocr_reader = easyocr.Reader(['ar'], gpu=use_gpu_ocr, verbose=False)
+                    ocr_reader = easyocr.Reader(['ar', 'en'], gpu=use_gpu_ocr, verbose=False)
                 except Exception as exc:
                     print(f"[WARN] EasyOCR GPU init failed ({exc}); falling back to CPU.")
-                    ocr_reader = easyocr.Reader(['ar'], gpu=False, verbose=False)
+                    ocr_reader = easyocr.Reader(['ar', 'en'], gpu=False, verbose=False)
                 print("EasyOCR ready.")
             else:
                 print("[WARN] EasyOCR not available — OCR skipped.")
