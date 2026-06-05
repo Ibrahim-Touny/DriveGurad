@@ -250,16 +250,23 @@ class PlateTracker:
                 'box': box,
                 'text': new_text,
                 'age': 0,
-                'last_ocr_frame': frame_idx if ocr_ran else None,
+                'last_ocr_frame': frame_idx if (ocr_ran and bool(new_text)) else None,
             })
             return new_text
 
         track['box'] = box
         track['age'] = 0
         if ocr_ran:
-            track['last_ocr_frame'] = frame_idx
-            if new_text:  # only overwrite with a real read
+            if new_text:
+                # First successful read: switch to regular cadence.
+                track['last_ocr_frame'] = frame_idx
                 track['text'] = new_text
+            elif not track.get('text'):
+                # No text yet: retry OCR on the very next frame.
+                track['last_ocr_frame'] = None
+            else:
+                # Keep cadence once the track already has known text.
+                track['last_ocr_frame'] = frame_idx
         return track['text']
 
     def end_frame(self) -> None:
@@ -323,6 +330,14 @@ class DetectionPipeline:
         for model in (self.seatbelt_model, self.lp_model):
             if model is not None:
                 self._predict(model, batch, self.sub_imgsz)
+
+        if self.ocr_reader is not None:
+            # Warm OCR once so the first real plate does not stall for model init.
+            try:
+                ocr_warm = np.zeros((48, 192, 3), dtype=np.uint8)
+                self.ocr_reader.readtext(ocr_warm, detail=0, paragraph=False)
+            except Exception:
+                pass
 
     def reset_temporal_state(self) -> None:
         """Reset per-stream tracking state before processing a new file."""
