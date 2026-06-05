@@ -1,0 +1,11 @@
+ultralytics
+opencv-python-headless
+torch
+torchvision
+easyocr
+arabic-reshaper
+python-bidi
+pillow
+numpy
+fastapi
+python-multipart
