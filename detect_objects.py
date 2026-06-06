@@ -273,6 +273,7 @@ class DetectionPipeline:
             source, conf=self.conf, iou=self.iou, imgsz=imgsz or self.imgsz,
             device=self.device, half=self.half, verbose=False,
         ) # half: use half precision on GPU for speed
+    #model.predict returns a list of results, one per image in the batch. Each result has .boxes, .names, etc.
 
     def warmup(self) -> None: # First inference is slow due to CUDA context init and cuDNN autotuning, so run dummy inference to warm up.
         """Run dummy inference so CUDA/cuDNN prepares the shapes used later."""
