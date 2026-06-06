@@ -104,7 +104,7 @@ def get_runtime():
         device=device,
         imgsz=640,
         sub_imgsz=320,
-        ocr_every=1,
+        ocr_every=5,
         max_vehicles=8,
         profile=False,
     )
@@ -313,6 +313,8 @@ def process_video_file(
                         force_ocr=(enable_ocr and enable_license_plate),
                     )
                     capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    if hasattr(pipeline, "reset_temporal_state"):
+                        pipeline.reset_temporal_state()
 
                 while True:
                     success, frame = capture.read()
